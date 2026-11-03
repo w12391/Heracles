@@ -1,3 +1,6 @@
+// vendored: modified by Heracles
+// 断言口径补丁：`skill_path` 期望值改为产品规范形态（`/`），使该用例在 Windows
+// 上可用。POSIX 下等价、强度不变。详见文件末尾 `_asProductPath`。
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -108,7 +111,10 @@ void main() {
     expect(injectedSkills, hasLength(1));
     expect(
       injectedSkills.single.metadata?['skill_path'],
-      skillFile.absolute.path,
+      // 与产品同口径比较（说明见文件末尾 `_asProductPath`）：
+      // 产品把 skill_path 统一成 `/`，而 `Directory.path` 在 Windows 上给 `\`。
+      // POSIX 下两者字面相同 ⇒ 断言等价；不做这一步则 Windows 恒红。
+      _asProductPath(skillFile.absolute.path),
     );
 
     final systemPrompt = client.capturedMessages.single
@@ -133,7 +139,8 @@ void main() {
     expect(injectedSkills, hasLength(1));
     expect(
       injectedSkills.single.metadata?['skill_path'],
-      skillFile.absolute.path,
+      // 同上：按产品的规范形态（`/`）比较，理由见 `_asProductPath`。
+      _asProductPath(skillFile.absolute.path),
     );
   });
 
@@ -165,7 +172,11 @@ void main() {
       _injectedSkillMessages(
         state,
       ).map((message) => message.metadata?['skill_path']),
-      unorderedEquals([systemSkill.absolute.path, projectSkill.absolute.path]),
+      unorderedEquals([
+        // 同上：按产品的规范形态（`/`）比较，理由见 `_asProductPath`。
+        _asProductPath(systemSkill.absolute.path),
+        _asProductPath(projectSkill.absolute.path),
+      ]),
     );
   });
 
@@ -204,6 +215,92 @@ void main() {
       expect(jsonDecode(insideResult), containsPair('success', true));
       expect(outsideResult, contains('must stay under'));
       expect(runtime.executedPaths, [insideScript.absolute.path]);
+    },
+  );
+
+  // ==========================================================================
+  // ★ 2026-11-03（QA，T-core-1-VERIFY）：`..` 折叠的回归门禁
+  //
+  // 为什么单独加这两条：修 `76d969a` 里「`_comparisonPath` 必须折叠 `..`」是全
+  // 套件**零覆盖**的安全加固 —— 实测把折叠摘掉，原有 13 条**全绿**
+  // （0 条红），也就是说这条越权通道此前没有任何测试守着。
+  //
+  // 失败模式（不折叠时）：`<root>/../outside.js` 以 `<root>/` 为前缀 ⇒ 通过
+  // 白名单 ⇒ 被放行并执行。同时补一条正向用例，防止将来有人用「一律拒绝」蒙混
+  // 过负向用例。
+  // ==========================================================================
+
+  test(
+    'skill roots reject .. traversal that escapes the root',
+    () async {
+      final root = Directory('${tempDirectory.path}/allowed')..createSync();
+      // 与白名单根**同级**的外部脚本：只有把 `..` 折叠掉才能判出它越界
+      final outsideScript = File('${tempDirectory.path}/outside.js')
+        ..writeAsStringSync('// must not run');
+      final traversalPath = '${root.path}/../outside.js';
+
+      final runtime = _RecordingJavaScriptRuntime();
+      final agent = _createAgent(
+        skillDirectoryPaths: [root.path],
+        javaScriptRuntime: runtime,
+      );
+      final runJavaScript = agent.composeTools().singleWhere(
+        (tool) => tool.name == 'RunJavaScript',
+      );
+
+      final result =
+          await Function.apply(runJavaScript.executable!, [
+                traversalPath,
+                null,
+                null,
+              ])
+              as String;
+
+      expect(
+        result,
+        contains('script path must stay under one of the skillDirectoryPaths.'),
+        reason: '`<root>/../outside.js` 折叠后越出白名单根，必须被拒（否则是越权通道）',
+      );
+      expect(runtime.executedPaths, isEmpty, reason: '被拒绝的脚本绝不能被运行时执行');
+      // 反向确认这条用例的确触到了"越界"而不是别的原因（如文件不存在）
+      expect(outsideScript.existsSync(), isTrue, reason: '外部脚本必须真实存在');
+    },
+  );
+
+  test(
+    'skill roots allow .. that folds back inside the root',
+    () async {
+      final root = Directory('${tempDirectory.path}/allowed')..createSync();
+      // `../` 拐一下仍落在根内 ⇒ 折叠后应判为合法，必须放行并执行
+      Directory('${tempDirectory.path}/allowed2')..createSync();
+      final insideScript = File('${root.path}/inside.js')
+        ..writeAsStringSync('// allowed');
+      final foldedInsidePath = '${tempDirectory.path}/allowed2/../allowed/inside.js';
+
+      final runtime = _RecordingJavaScriptRuntime();
+      final agent = _createAgent(
+        skillDirectoryPaths: [root.path],
+        javaScriptRuntime: runtime,
+      );
+      final runJavaScript = agent.composeTools().singleWhere(
+        (tool) => tool.name == 'RunJavaScript',
+      );
+
+      final result =
+          await Function.apply(runJavaScript.executable!, [
+                foldedInsidePath,
+                null,
+                null,
+              ])
+              as String;
+
+      expect(
+        jsonDecode(result),
+        containsPair('success', true),
+        reason: '折叠后落在根内的脚本必须放行 —— 不许用"一律拒绝"糊过负向用例',
+      );
+      expect(runtime.executedPaths, [File(foldedInsidePath).absolute.path],
+          reason: '放行的就是这一条，且交给运行时的仍是原生路径');
     },
   );
 
@@ -504,6 +601,22 @@ List<UserMessage> _injectedSkillMessages(AgentState state) {
       .where((message) => message.metadata?['type'] == 'skill_instructions')
       .toList();
 }
+
+/// 把「期望路径」折成**产品的规范形态**（分隔符统一为 `/`）再比较。
+///
+/// 为什么需要这一步（不是放宽断言）：
+/// * 产品侧 `skill.dart` 的 `_normalizePath` 会把技能文件路径统一成 `/`，写进
+///   `DirectorySkillMetadata.pathToSkillMd` → `metadata['skill_path']`；
+/// * 测试侧用 `Directory('${tempDirectory.path}/x')` 拼路径，在 Windows 上
+///   `Directory.path` / `File.absolute.path` 保留 `\`，于是期望值是
+///   `F:\...\x/y/SKILL.md` 这种**混合形态**，与产品的 `/` 形态字面不等；
+/// * POSIX 下两者都是 `/`，本函数是 no-op ⇒ 断言**语义与强度完全不变**，
+///   差别只在「不再假设平台分隔符等于框架归一化结果」。
+///
+/// 也就是说：断言仍然钉住同一个规范路径；去掉这一步，Windows 上恒红（红的是
+/// 断言的可移植性，不是产品行为）。产品侧的对应修复见
+/// `lib/src/agent/stateful_agent.dart` 的 `_comparisonPath`。
+String _asProductPath(String path) => path.replaceAll(r'\', '/');
 
 StatefulAgent _createAgent({
   LLMClient? client,
