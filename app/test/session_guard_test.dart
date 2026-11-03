@@ -16,6 +16,7 @@ import 'package:heracles/screens/chat_screen.dart';
 import 'package:heracles/services/settings_controller.dart';
 import 'package:heracles/theme/app_theme.dart';
 import 'package:heracles/theme/cupertino_kit.dart' show AppIcons;
+import 'package:heracles/widgets/input_bar.dart' show InputBar;
 
 import 'support/secure_storage_mock.dart';
 
@@ -244,21 +245,26 @@ void main() {
     });
   }
 
-  /// **打开抽屉**：原型 01（`1f52b1d`，2026-10-25）之后顶栏左侧**不再有 ☰ 线条图标**，
-/// 换成**品牌图标**（真实 App 图标，点它开抽屉 —— 用户禁用线条式图标）。
-/// 所以按 **asset 名**定位，而不是按图标字形（否则 finder 会随 UI 改版失效）。
-  Finder drawerOpener() => find.byWidgetPredicate(
-        (w) =>
-            w is Image &&
-            w.image is AssetImage &&
-            (w.image as AssetImage).assetName.contains('app_icon_source'),
-        description: '顶栏左侧品牌图标（打开抽屉）',
-      );
-
+  /// **打开抽屉**（2026-11-02 修夹具：入口换了，断言未动）。
+  ///
+  /// 顶栏品牌图标已改为「**切换工作/决策模式**」（`chat_screen.dart:5279`
+  /// 明写"取代原「点图标开抽屉」"）⇒ 旧写法点它只会切模式，抽屉根本没开，
+  /// 后续"找不到 ⊕ / 找不到会话 B"全是连带假象。
+  ///
+  /// 抽屉现在两个真入口：① 200dp 左边缘拖动；② **输入区信息条上的工作区名**
+  /// （`chat_screen.dart:5589` `onWorkspaceTap` ⇒ `openDrawer()`）。
+  /// 这里走 ②：可点、可定位，且用户真会走。
   Future<void> openDrawer(WidgetTester tester) async {
-    expect(drawerOpener(), findsOneWidget,
-        reason: '顶栏左侧必须有品牌图标（点它开抽屉）—— 找不到说明顶栏又改了');
-    await tester.tap(drawerOpener());
+    // 锚在输入条内部：'proj' 在整屏里会出现 2 处（信息条 + 首屏空态文案），
+    // 所以用 InputBar 做作用域，而不是裸 find.text（别用 .first 蒙）。
+    final opener = find.descendant(
+      of: find.byType(InputBar),
+      matching: find.text('proj'),
+    );
+    expect(opener, findsOneWidget,
+        reason: '输入区信息条上必须有工作区名「proj」—— '
+            '它现在是唯一可点的抽屉入口（顶栏图标已改成切模式）');
+    await tester.tap(opener);
     await settle(tester);
   }
 
@@ -404,6 +410,42 @@ void main() {
     expect(find.textContaining('写入了'), findsOneWidget);
     expect(find.text('【A 的最终回答】'), findsOneWidget);
     expect(inputEnabled(tester), isTrue);
+  });
+
+  // ==================================================================
+  // 顶栏品牌图标（**单独一条，不与别的断言混在一起**）
+  // ==================================================================
+
+  /// ★ 2026-11-02：**补回覆盖损失**（不是行为变更）。
+  ///
+  /// 上一轮把 `openDrawer` 的入口从「顶栏品牌图标」换成「输入条工作区名」时，
+  /// 连带删掉了原本挂在 `drawerOpener()` 上的那条
+  /// 「顶栏品牌图标必须存在（asset 含 `app_icon_source`）」断言 ——
+  /// 于是**现在没有任何用例守着这颗图标**。
+  ///
+  /// 它为什么必须有人守：点它是**唯一**能切「工作 / 决策」模式的入口
+  /// （`chat_screen.dart:5279`，产品明确"取代点图标开抽屉"）。
+  /// 图标被换掉、asset 改名、`leading` 被改，这个能力都会静默消失，
+  /// 而其它用例（走信息条开抽屉）一条都不会红。
+  ///
+  /// 只断这一件事：找到**恰好一个** asset 含 `app_icon_source` 的 Image。
+  phoneTest('★ 顶栏品牌图标仍在（asset 含 app_icon_source）', (tester) async {
+    final c = await freshController();
+    installMocks();
+
+    await tester.pumpWidget(wrap(c, ChatScreen(settings: c)));
+    await settle(tester);
+
+    final brand = find.byWidgetPredicate(
+      (w) =>
+          w is Image &&
+          w.image is AssetImage &&
+          (w.image as AssetImage).assetName.contains('app_icon_source'),
+      description: '顶栏品牌图标（asset 含 app_icon_source）',
+    );
+    expect(brand, findsOneWidget,
+        reason: '顶栏品牌图标必须存在 —— 点它是唯一能切「工作/决策」模式的入口；'
+            '找不到说明顶栏又改了（或 asset 改名），而这个能力会静默消失');
   });
 
   phoneTest('★★ 切会话后事件流订阅确实被取消（B 不会被 A 的事件污染）',
@@ -804,12 +846,27 @@ void main() {
             '旧 bug 正是停止键走了 onTap: _send');
 
     // ★ 界面如实说明"是用户停的"
-    expect(find.textContaining('已停止'), findsOneWidget,
-        reason: '停止后要明确告诉用户，而不是留一个空白让人以为回答完了');
+    //
+    // ★★ 2026-11-02 修时序（断言没放宽，改的是「什么时候该出现」）：
+    //   产品已刻意把「已停止」**延后到这一轮真正收尾时**才补到消息末尾
+    //   （`chat_screen.dart:4423`「『已停止』不在这里写」+ `:4799`「在这里补到最末尾」，
+    //   2026-10-27 图二修复：立刻写会插在思考/步骤**上方**，看起来像回答被截断）。
+    //   所以在点停止的同一拍断言它出现，测的是**旧行为**，永远红。
+    //   正确的落点是 `gate.complete()`（后台 run 收尾）之后。
+    // ★ 2026-11-02 文案更正：产品写的是「**用户选择停止。你可以继续发消息。**」
+    //   （`chat_screen.dart:4851`，2026-10-29 用户要求"要写明是用户停的"），
+    //   不是旧文案「已停止」—— 旧断言找的是一句今天不存在的字。
+    expect(find.textContaining('用户选择停止'), findsNothing,
+        reason: '点停止的同一拍**不该**已经冒出停止提示 —— '
+            '它要等到这轮真正收尾才补（否则会插在思考块上方，见 chat_screen.dart:4423）');
 
     gate.complete();
     await settle(tester);
     await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.textContaining('用户选择停止'), findsOneWidget,
+        reason: '停止的 run 收尾后要明确告诉用户"是你停的"、'
+            '而不是留一个空白让人以为回答完了');
   });
 
   /// 没有在跑的时候点"停止"不该误伤 —— 幂等，且不写"已停止"消息。
@@ -905,6 +962,11 @@ void main() {
     gate.complete();
     await settle(tester);
     await tester.pump(const Duration(milliseconds: 400));
+    // ★ 2026-11-02：把排队 toast 的自动消失计时器走完
+    //   （`showIosToast` 用 `Future.delayed(2200ms)` 收自己）。
+    //   不收尾会在 teardown 报 "A Timer is still pending" —— 那是测试没等完，
+    //   不是产品泄漏。
+    await tester.pump(const Duration(milliseconds: 2400));
   });
 
   // ==================================================================
@@ -962,8 +1024,20 @@ void main() {
     //   "排队的消息要在输入框上面显示……不是在工作步骤里显示已排队"）。
     //   所以这里断言：① 消息列表里**没有**"已排队"字样；
     //   ② 排队条上**有**这条消息的原文（queue 图标行）。
-    expect(find.textContaining('已排队'), findsNothing,
-        reason: '排队不是对话的一部分 —— 不能在工作步骤里显示');
+    // ★ 2026-11-02 修断言对象（不是放宽）：旧断言在**整棵树**里找「已排队」，
+    //   而产品在排队时会给一条 toast（`chat_screen.dart:4020`
+    //   「已排队，当前任务结束后自动发送」）—— toast 在 Overlay 里，本来就不该算
+    //   "对话的一部分"。要钉的是「**消息列表**里不许出现已排队」，
+    //   所以把作用域收窄到消息列表；并额外钉住那条 toast 真的给了
+    //   （否则用户排队后毫无反馈）。
+    final queuedInList = find.descendant(
+      of: find.byType(ListView).first,
+      matching: find.textContaining('已排队'),
+    );
+    expect(queuedInList, findsNothing,
+        reason: '排队不是对话的一部分 —— 不能在工作步骤/消息列表里显示');
+    expect(find.textContaining('已排队'), findsOneWidget,
+        reason: '排队必须给一条瞬时提示（toast），否则用户不知道点下去有没有生效');
     expect(find.byTooltip('立即发送（打断当前任务）'), findsOneWidget,
         reason: '输入框上方必须有排队条（用户参考图）—— 同上：'
             '新 UI 有两个时钟图标，按 tooltip 钉排队行本身');
@@ -983,6 +1057,9 @@ void main() {
     expect(runStarts.length, 2,
         reason: '前一个结束后，排队的那条必须自动发出 —— '
             '否则"排队"就是骗人的（消息永远躺在队列里）');
+
+    // 同前：走完排队 toast 的自动消失计时器（否则 teardown 报 Timer is still pending）
+    await tester.pump(const Duration(milliseconds: 2400));
   });
 }
 
@@ -1022,6 +1099,7 @@ class _FakeExecutor extends LocalAgentExecutor {
   }) async {
     final controller = StreamController<AgentEvent>.broadcast();
     final done = Completer<AgentRunResult>();
+    var cancelRequested = false;
     onRunStarted(sessionId);
     onReady((e) async {
       if (!controller.isClosed) controller.add(e);
@@ -1039,17 +1117,20 @@ class _FakeExecutor extends LocalAgentExecutor {
         //   假执行器同样要关 —— 否则"run 已结束后再推的事件"会被当成
         //   仍在途的运行时事件（生产里根本不存在这个窗口）。
         if (!controller.isClosed) unawaited(controller.close());
-        if (!done.isCompleted) done.complete(_cannedResult());
+        if (!done.isCompleted) {
+          done.complete(_cannedResult(cancelled: cancelRequested));
+        }
       }));
     } else {
       if (!controller.isClosed) unawaited(controller.close());
-      done.complete(_cannedResult());
+      done.complete(_cannedResult(cancelled: cancelRequested));
     }
 
     return LocalRunHandle(
       events: controller.stream,
       result: done.future,
       cancel: () async {
+        cancelRequested = true;
         onCancel();
         return true;
       },
@@ -1057,7 +1138,13 @@ class _FakeExecutor extends LocalAgentExecutor {
   }
 
   /// 旧 Kotlin mock 的罐头返回值（形状对齐 AgentRunResult）。
-  static AgentRunResult _cannedResult() => AgentRunResult(
+  ///
+  /// ★ 2026-11-02：加 `cancelled` —— 生产里用户点停止后 `run()` 回的是
+  /// `cancelled: true`（`chat_screen.dart:4396` 注释），产品据此才把
+  /// 「已停止」补到消息末尾（`:4797` `result.cancelled`）。
+  /// 旧罐头恒为 false ⇒ 那条分支**从没被测过**（断言测错了对象）。
+  static AgentRunResult _cannedResult({bool cancelled = false}) => AgentRunResult(
+        cancelled: cancelled,
         stopReason: '已给出最终回答',
         finalText: '【A 的最终回答】',
         sessionId: 'sess-A',

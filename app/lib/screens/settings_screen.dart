@@ -4,9 +4,9 @@ import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../models/jev.dart';
 import '../models/settings.dart';
@@ -22,6 +22,9 @@ import '../theme/stretch_segmented.dart';
 import '../theme/theme_reveal.dart';
 import '../data/open_source_licenses.dart';
 import '../widgets/bw_approval.dart';
+import '../widgets/background_keepalive_card.dart';
+// 技能 / MCP / 自动化三页的入口已移到主页抽屉（2026-11-02 用户裁定），
+// 这里不再 import（单一入口，避免两处维护）。
 import 'jev_settings_screen.dart';
 import 'oss_licenses_screen.dart';
 import 'voice_settings_screen.dart';
@@ -101,6 +104,9 @@ class SettingsScreen extends StatelessWidget {
                   _SandboxEntry(
                     onOpen: () => _push(context, const SandboxScreen()),
                   ),
+                  // ★ 2026-11-02：技能 / MCP / 自动化三行**移出设置页**
+                  //   （用户裁定：三个智能体入口放主页抽屉 —— 单一入口，
+                  //   避免两处维护；本组还有记忆/权限/语音/沙箱/模型，标签不变）。
                   if (archivedCountLoader != null && onOpenArchived != null)
                     _ArchivedEntry(
                       countOf: archivedCountLoader!,
@@ -301,6 +307,35 @@ class _VoiceEntryState extends State<_VoiceEntry> {
 /// 检测 + 引导 —— 不做配对执行器（完整 shell 能力下批）。
 /// `WRITE_SECURE_SETTINGS` 是无障碍自愈的钥匙（ADR-016，P0），
 /// 授权一次三类能力全解锁（pm grant 的效果是复用的）。
+/// **后台运行二级页**（2026-11-02 用户裁定）：入口在「设备权限」第一行，
+/// 点进来是独立页；卡片形态与权限页一致，不再占设置主页。
+class BackgroundKeepalivePage extends StatelessWidget {
+  const BackgroundKeepalivePage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final h = Hue.of(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('后台运行'),
+        leading: _iosBackLeading(context),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(HSpace.lg),
+        children: [
+          Text(
+            '长任务在后台继续跑需要的系统设置。Android 不保证永不被杀；'
+            '这里只显示真实状态与引导，不假装“开了就一直跑”。',
+            style: TextStyle(fontSize: 12.5, height: 1.55, color: h.textFaint),
+          ),
+          const SizedBox(height: HSpace.md),
+          const BackgroundKeepaliveCard(),
+        ],
+      ),
+    );
+  }
+}
+
 class DevicePermissionPage extends StatefulWidget {
   const DevicePermissionPage({super.key});
 
@@ -560,6 +595,21 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Column(
         children: [
+          // ★ F-A（2026-11-02）：「后台运行」入口行并入本卡（第一行），
+          //   视觉归组 —— 点击仍进 BackgroundKeepalivePage（内容不变）。
+          KeyedSubtree(
+            key: const Key('device-permission-background-row'),
+            child: _HomeRow(
+              title: '后台运行',
+              subtitle: '保活状态 · 电池优化 · 自启动',
+              onTap: () => Navigator.of(context).push(
+                CupertinoPageRoute(
+                  builder: (_) => const BackgroundKeepalivePage(),
+                ),
+              ),
+            ),
+          ),
+          Divider(height: 1, indent: 18, endIndent: 18, color: h.border),
           for (var i = 0; i < rows.length; i++) ...[
             if (i > 0)
               Divider(height: 1, indent: 18, endIndent: 18, color: h.border),
@@ -682,8 +732,28 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
           : ListView(
               padding: const EdgeInsets.all(HSpace.lg),
               children: [
-                // ---- 权限总览卡（概念图 07 形态）----
-                if (_perms.isNotEmpty) _permOverview(h),
+                // ---- F-A（2026-11-02）：「后台运行」入口行**并入权限卡**
+                //   （视觉归组，不再单独一张卡割裂）。权限查询为空时才单独
+                //   兜底一张卡，保证入口恒在。点击仍进 BackgroundKeepalivePage。
+                if (_perms.isNotEmpty)
+                  _permOverview(h)
+                else
+                  _GroupCard(
+                    children: [
+                      KeyedSubtree(
+                        key: const Key('device-permission-background-row'),
+                        child: _HomeRow(
+                          title: '后台运行',
+                          subtitle: '保活状态 · 电池优化 · 自启动',
+                          onTap: () => Navigator.of(context).push(
+                            CupertinoPageRoute(
+                              builder: (_) => const BackgroundKeepalivePage(),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                 // ---- 卡下说明：自愈状态 + 概念图 07 页脚 ----
                 const SizedBox(height: HSpace.md),
                 Text(
@@ -2225,16 +2295,6 @@ class _MemoryEditorSheetState extends State<_MemoryEditorSheet> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Center(
-                child: Container(
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: h.border,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
               const SizedBox(height: HSpace.md),
               Text(
                 _isEdit ? '编辑记忆' : '添加记忆',
@@ -2583,41 +2643,7 @@ class ModelSettingsPage extends StatelessWidget {
   }
 }
 
-/// 提供商菜单行（与全 App 抽屉菜单同一规格）。
-Widget _providerMenuRow(
-  Hue h, {
-  required IconData icon,
-  required String label,
-  String? subtitle,
-  bool danger = false,
-  required VoidCallback onTap,
-}) {
-  final color = danger ? HColors.errorOn(h.dark) : h.text;
-  return InkWell(
-    borderRadius: BorderRadius.circular(12),
-    onTap: onTap,
-    child: Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-      child: Row(
-        children: [
-          Icon(icon, size: 19, color: color),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label, style: TextStyle(fontSize: 15, color: color)),
-                if (subtitle != null)
-                  Text(subtitle,
-                      style: TextStyle(fontSize: 11.5, color: h.textFaint)),
-              ],
-            ),
-          ),
-        ],
-      ),
-    ),
-  );
-}
+/// 提供商菜单行已统一迁到 [BwActionCard]（2026-10-31 T2-4），不再保留裸 InkWell 行。
 
 class _ProviderCard extends StatelessWidget {
   const _ProviderCard({
@@ -2673,14 +2699,15 @@ class _ProviderCard extends StatelessWidget {
                         color: h.text),
                   ),
                 ),
-                _providerMenuRow(
-                  h,
+                BwActionCard(
+                  h: h,
                   icon: CupertinoIcons.square_pencil_fill,
                   label: '编辑',
                   onTap: () => Navigator.of(sheetCtx).pop(false),
                 ),
-                _providerMenuRow(
-                  h,
+                const SizedBox(height: 8),
+                BwActionCard(
+                  h: h,
                   icon: CupertinoIcons.trash_fill,
                   label: '删除',
                   subtitle: '同时清除已保存的 API Key',
@@ -3900,8 +3927,22 @@ class _ThemeCard extends StatelessWidget {
       );
 }
 
+/// 打开一条外部链接（可注入：widget 测试给假实现断言 URL/模式；
+/// 生产默认走 `url_launcher` 的系统浏览器）。
+typedef AboutUrlOpener = Future<bool> Function(Uri url, LaunchMode mode);
+
+/// 生产默认实现：**系统浏览器**打开（[LaunchMode.externalApplication]）。
+///
+/// 返回值就是 url_launcher 的语义：`false` = 没打开（没有处理该 URL 的
+/// Activity 等）——调用方必须如实提示，不能默认成功。
+Future<bool> openExternalInBrowser(Uri url, LaunchMode mode) =>
+    launchUrl(url, mode: mode);
+
 class AboutPage extends StatefulWidget {
-  const AboutPage({super.key});
+  const AboutPage({super.key, this.urlOpener});
+
+  /// 外链打开实现；null = 生产默认 [openExternalInBrowser]。
+  final AboutUrlOpener? urlOpener;
 
   @override
   State<AboutPage> createState() => _AboutPageState();
@@ -3929,9 +3970,27 @@ class _AboutPageState extends State<AboutPage> {
   static const _repoUrl = 'https://github.com/theohowie/Heracles';
   static const _issuesUrl = 'https://github.com/theohowie/Heracles/issues';
 
-  void _copy(BuildContext context, String text) {
-    Clipboard.setData(ClipboardData(text: text));
-    showIosToast(context, '链接已复制');
+  /// 外链 = **真跳转**（2026-10-29 T1 第 5 条）：
+  /// 旧版只把链接塞剪贴板 + 「链接已复制」，用户点了浏览器没反应；
+  /// 现在一律 `externalApplication` 交给系统浏览器打开，失败如实 Toast。
+  Future<void> _openUrl(String url) async {
+    var opened = false;
+    try {
+      final opener = widget.urlOpener ?? openExternalInBrowser;
+      opened = await opener(Uri.parse(url), LaunchMode.externalApplication);
+    } catch (_) {
+      // 通道不可用 / ActivityNotFound：统一折成"没打开"，交给下面说人话。
+      opened = false;
+    }
+    if (!mounted) return;
+    if (!opened) showIosToast(context, '无法打开浏览器');
+  }
+
+  /// 开源许可证 = **应用内完整列表**（同一套 iOS 侧滑路由，与设置页二级页一致）。
+  void _openLicenses() {
+    Navigator.of(context).push(
+      CupertinoPageRoute<void>(builder: (_) => const OssLicensesScreen()),
+    );
   }
 
   @override
@@ -4052,14 +4111,18 @@ class _AboutPageState extends State<AboutPage> {
               _CardRow(
                 title: 'GitHub 仓库',
                 value: 'theohowie/Heracles',
-                onTap: () => _copy(context, _repoUrl),
+                onTap: () => _openUrl(_repoUrl),
               ),
               _CardRow(
                 title: '问题反馈',
                 value: 'GitHub Issues',
-                onTap: () => _copy(context, _issuesUrl),
+                onTap: () => _openUrl(_issuesUrl),
               ),
-              const _CardRow(title: '开源许可证', value: '见仓库 LICENSE'),
+              _CardRow(
+                title: '开源许可证',
+                value: '完整列表',
+                onTap: _openLicenses,
+              ),
             ],
           ),
           const SizedBox(height: 20),

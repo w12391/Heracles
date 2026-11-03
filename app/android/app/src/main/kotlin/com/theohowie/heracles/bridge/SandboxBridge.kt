@@ -25,6 +25,7 @@ import com.heracles.sandbox.file.PathSemantics
 import com.heracles.sandbox.file.SandboxFileService
 import com.heracles.sandbox.file.ZeroWidthFileChannel
 import com.heracles.sandbox.runtime.SandboxDependencies
+import com.heracles.sandbox.runtime.SandboxEnvManager
 import com.heracles.sandbox.runtime.SandboxServiceCore
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -508,6 +509,9 @@ class SandboxBridge(
                             "version" to s.version,
                             "installDir" to s.installDir,
                             "parts" to s.parts,
+                            // T2-6 只增字段（UI 用来显示「占用多少 / 缺哪项」）
+                            "occupiedBytes" to s.occupiedBytes,
+                            "missing" to s.missing,
                         )
                     },
                     onFailure = { e -> failure(e.message ?: e.javaClass.simpleName) },
@@ -541,10 +545,162 @@ class SandboxBridge(
             }
 
             "resetBuildSuite" -> scope.launch {
-                val r = withContext(Dispatchers.IO) { runCatching { toolchain.reset() } }
+                // T2-6：卸载返回**真状态**（删除清单 / 失败项 / 释放字节 / 当前缺失项），
+                // 而不是一个 Boolean —— UI 要说清「删了什么、为什么失败、现在缺什么」。
+                val r = withContext(Dispatchers.IO) {
+                    runCatching { runBlocking { toolchain.reset() } }
+                }
                 reply(result, r.fold(
-                    onSuccess = { ok -> mapOf("ok" to true, "cleared" to ok) },
+                    onSuccess = { x ->
+                        mapOf(
+                            "ok" to x.success,
+                            "ready" to x.ready,
+                            "installDir" to x.installDir,
+                            "removed" to x.removed,
+                            "failed" to x.failed.map { mapOf("path" to it.path, "reason" to it.reason) },
+                            "freedBytes" to x.freedBytes,
+                            "missing" to x.missing,
+                            "message" to x.message,
+                        )
+                    },
                     onFailure = { e -> failure(e.message ?: e.javaClass.simpleName) },
+                ))
+            }
+
+            // ---- ★ V0.4 T0-3（2026-11-02）：沙箱环境管理（L1 only）----
+            //   `SandboxEnvManager` 是纯逻辑（配方/网络策略/项目识别），安装执行走沙箱 shell。
+            //   ⚠️ 真实安装（apk/npm/pip 到 /opt/envs/<name>）尚未接线 ⇒ installEnv 明确失败，
+            //   不假装装好（见 docs/接口.md §10.3）。
+            "envProfile" -> {
+                val n = com.heracles.sandbox.runtime.NetworkPolicy()
+                reply(result, mapOf(
+                    "ok" to true,
+                    "isolationTier" to "process",
+                    "tierImplemented" to true,
+                    "network" to mapOf(
+                        "whitelistOnly" to n.whitelistOnly,
+                        "allowAllOutbound" to n.allowAllOutbound,
+                        "riskLevel" to n.riskLevel,
+                        "riskNote" to n.riskNote,
+                        "hosts" to n.effectiveHosts(),
+                        "proxy" to n.proxy,
+                    ),
+                    // 已安装环境：安装执行未接线 ⇒ 恒空（不假装有）
+                    "envs" to emptyList<String>(),
+                ))
+            }
+
+            "installEnv" -> {
+                val name = call.argument<String>("name") ?: ""
+                // ★ 2026-11-02：**真实安装**（沙箱内跑配方命令 + --version 校验）。
+                //   失败如实返回（不假装装好）；进度推到流式通道。
+                val progressId = nextExecutionId()
+                scope.launch {
+                    val out = withContext(Dispatchers.IO) {
+                        runCatching {
+                            SandboxEnvManager.installEnv(
+                                name,
+                                exec = { cmd, timeoutMs ->
+                                    val r = core.executeAndWait(
+                                        ExecutionRequest(
+                                            command = cmd,
+                                            workingDirectory = "/",
+                                            timeoutMillis = timeoutMs,
+                                        ),
+                                        object : com.heracles.sandbox.runtime.ExecutionSink {
+                                            override fun onOutput(
+                                                stream: Int,
+                                                chunk: String,
+                                                sequence: Long,
+                                            ) = Unit
+
+                                            override fun onProgress(percent: Int, message: String) = Unit
+                                            override fun onExit(result: ExecutionResult) = Unit
+                                            override fun onError(code: Int, message: String) = Unit
+                                            override fun isCancelled(): Boolean = false
+                                        },
+                                    )
+                                    r.stdout
+                                },
+                                onProgress = { msg -> emitProgress(progressId, 0, 0, msg) },
+                            )
+                        }.getOrElse { e ->
+                            mapOf(
+                                "ok" to false,
+                                "name" to name,
+                                "error" to "安装异常：${e.message ?: e.javaClass.simpleName}",
+                            )
+                        }
+                    }
+                    reply(result, out)
+                }
+            }
+
+            "uninstallEnv" -> {
+                val name = call.argument<String>("name") ?: ""
+                val recipe = SandboxEnvManager.recipe(name)
+                if (recipe == null) {
+                    reply(result, mapOf("ok" to false, "error" to "未知环境：$name（不猜）"))
+                } else {
+                    // 卸载：按配方的安装来源反向删（apk 装的用 apk del；其它明确未接）
+                    scope.launch {
+                        val out = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val isApk = recipe.installCommands.any { it.startsWith("apk add") }
+                                if (!isApk) {
+                                    mapOf(
+                                        "ok" to false,
+                                        "name" to name,
+                                        "error" to "该环境的卸载方式未接线（非 apk 来源：${recipe.source}）",
+                                    )
+                                } else {
+                                    val pkg = recipe.installCommands
+                                        .first { it.startsWith("apk add") }
+                                        .removePrefix("apk add")
+                                        .trim()
+                                    val r = core.executeAndWait(
+                                        ExecutionRequest(
+                                            command = "apk del $pkg",
+                                            workingDirectory = "/",
+                                            timeoutMillis = 120_000L,
+                                        ),
+                                        object : com.heracles.sandbox.runtime.ExecutionSink {
+                                            override fun onOutput(
+                                                stream: Int,
+                                                chunk: String,
+                                                sequence: Long,
+                                            ) = Unit
+
+                                            override fun onProgress(percent: Int, message: String) = Unit
+                                            override fun onExit(result: ExecutionResult) = Unit
+                                            override fun onError(code: Int, message: String) = Unit
+                                            override fun isCancelled(): Boolean = false
+                                        },
+                                    )
+                                    if (r.exitCode == 0) {
+                                        mapOf("ok" to true, "name" to name, "message" to "已卸载 $pkg")
+                                    } else {
+                                        mapOf(
+                                            "ok" to false,
+                                            "name" to name,
+                                            "error" to "apk del 失败（exit=${r.exitCode}）：${r.stderr.takeLast(300)}",
+                                        )
+                                    }
+                                }
+                            }.getOrElse { e ->
+                                mapOf("ok" to false, "error" to "卸载异常：${e.message ?: e.javaClass.simpleName}")
+                            }
+                        }
+                        reply(result, out)
+                    }
+                }
+            }
+
+            "detectProjectEnv" -> {
+                val files = call.argument<List<String>>("files") ?: emptyList()
+                reply(result, mapOf(
+                    "ok" to true,
+                    "envs" to SandboxEnvManager.detectProject(files),
                 ))
             }
 

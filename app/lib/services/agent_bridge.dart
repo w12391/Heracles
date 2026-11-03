@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:heracles_backend/heracles_backend.dart' as hb;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -225,6 +226,24 @@ class AgentBridge {
   static Stream<Map<String, String>> get openSessionRequests =>
       _openSessionCtl.stream;
 
+  /// **Kotlin → Dart：刚登记了一个新工作区**（2026-11-02 T0）。
+  ///
+  /// ## 为什么需要这条反方向通知
+  ///
+  /// SAF 选择器期间 Activity 被系统回收时，Flutter 引擎也会一起重建 ⇒
+  /// **Dart isolate 是全新的**：原来那个 `await pickWorkspace()` 早就不存在了。
+  /// 新的 Dart 应用启动时会先 `listWorkspaces()`（此时新目录还没登记完），
+  /// 几百毫秒后 Kotlin 才在 `onActivityResult` 里把目录写进登记表 ——
+  /// 界面上的列表已经刷过去了，用户会以为"又没选上"。
+  ///
+  /// ⇒ 宿主登记成功后推一条 [hb.ContractFolderPicker.addedPushMethod]，
+  /// 界面收到就重载列表。旧宿主不推 ⇒ 只是少一次刷新，不报错。
+  static final StreamController<Map<String, dynamic>> _workspaceAddedCtl =
+      StreamController<Map<String, dynamic>>.broadcast();
+
+  static Stream<Map<String, dynamic>> get workspaceAdded =>
+      _workspaceAddedCtl.stream;
+
   void _installOpenSessionHandler() {
     if (_openHandlerInstalled) return;
     _openHandlerInstalled = true;
@@ -236,6 +255,12 @@ class AgentBridge {
           'sessionId': (args['sessionId'] as String?) ?? '',
           'workspacePath': (args['workspacePath'] as String?) ?? '',
         });
+      } else if (call.method == hb.ContractFolderPicker.addedPushMethod) {
+        final raw = call.arguments;
+        final args = raw is Map
+            ? raw.cast<String, dynamic>()
+            : const <String, dynamic>{};
+        _workspaceAddedCtl.add(args);
       }
       return null;
     });
@@ -257,6 +282,171 @@ class AgentBridge {
       return null;
     } on PlatformException {
       return null;
+    }
+  }
+
+  /// **V0.4 T0-2 后台保活引导**（2026-11-02，只引导/只读，不改系统设置）。
+  ///
+  /// 三件事：
+  /// · [requestIgnoreBatteryOptimizations]：拉起系统"忽略电池优化"确认页；
+  /// · [autostartGuide]：返回 OEM 自启路径文案（**不自动跳转**）；
+  /// · [processKilled] / [consumeProcessKilled]：上次 run 是否被系统停止（如实提示，
+  ///   不假装继续；提示消费后清标记）。
+  ///
+  /// ★ 返回 `Future<bool?>`（2026-11-02 二次裁定）：三态**不许混** ——
+  /// · `null` = **当前版本不支持**（旧宿主没有这条通道，`MissingPluginException`）⇒
+  ///   UI 显示"当前版本不支持"，**不该引导用户"再试一次"**（试多少次都一样）；
+  /// · `false` = 没生效（`PlatformException` / 用户在授权页取消）⇒ UI 显示
+  ///   "没有生效，可再试"；
+  /// · `true` = 系统页已拉起并确认。
+  ///
+  /// ## 为什么不许吞成 false
+  ///
+  /// 旧实现把 `MissingPluginException` 也返回 `false` —— 旧宿主上用户点"去授权"
+  /// 会看到"没有生效，可再试"，于是反复重试一个**根本不存在的方法**。
+  /// "环境不支持"与"这次没成功"是两种失败，给用户的话术必须不同。
+  Future<bool?> requestIgnoreBatteryOptimizations() async {
+    try {
+      final ok = await _channel.invokeMethod<bool>('requestIgnoreBatteryOptimizations');
+      return ok ?? false;
+    } on MissingPluginException {
+      // 通道都不在 ⇒ 不是"这次失败"，是"没有这个能力"
+      return null;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  /// OEM 自启引导（`{brand, path}`）；通道不支持 ⇒ null（UI 显示通用说明）。
+  Future<({String brand, String path})?> autostartGuide() =>
+      oemGuide('autostart');
+
+  /// **MIUI 保活三件套引导**（2026-11-02，只给数据**不自动跳转** —— 契约红线）。
+  ///
+  /// [kind] ∈ `autostart`（自启动）/ `backgroundPopup`（后台弹出界面）/
+  /// `lockScreenShow`（锁屏显示）。
+  ///
+  /// · **未知 kind 在 Dart 侧先行拒绝**（`ArgumentError`，通道零调用）——
+  ///   拼错的 kind 打到宿主只会得到一句"未知方法"，排障绕远路；
+  /// · 宿主认不出的品牌给**通用兜底文案**（明说没有统一入口），**不编路径**；
+  /// · `null` = 不可用（`MissingPluginException`/`PlatformException`/宿主
+  ///   `ok:false`/brand 或 path 为空）—— 半截数据当没有，UI 显示通用说明。
+  Future<({String brand, String path})?> oemGuide(String kind) async {
+    const kinds = <String>{'autostart', 'backgroundPopup', 'lockScreenShow'};
+    if (!kinds.contains(kind)) {
+      throw ArgumentError.value(
+          kind, 'kind', '未知的引导类型（必须是 ${kinds.toList()..sort()} 之一）');
+    }
+    try {
+      final m = await _channel
+          .invokeMapMethod<String, dynamic>('oemGuide', {'kind': kind});
+      if (m == null || m['ok'] != true) return null;
+      final brand = (m['brand'] as String?) ?? '';
+      final path = (m['path'] as String?) ?? '';
+      if (brand.isEmpty || path.isEmpty) return null;
+      return (brand: brand, path: path);
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// **保活状态聚合查询**（2026-11-02，只读 —— 不拉系统页、不改设置）。
+  ///
+  /// 对应通道 `keepaliveStatus`：Kotlin 侧**真实查**（前台服务运行位 /
+  /// `PowerManager.isIgnoringBatteryOptimizations`），并附 MIUI 口径提醒
+  /// （省电策略「无限制」≠ 系统电池优化白名单，真机实测存在）。
+  ///
+  /// ## 缺的不编
+  ///
+  /// · **字段级**：宿主没给的字段保持 null（[`KeepaliveStatus`] 全字段可空）；
+  /// · **整体级**：`MissingPluginException`/`PlatformException`/宿主 `ok:false`
+  ///   ⇒ 返回 null —— 状态**不可用**，UI 显示通用说明，**不许编一个全 false 的
+  ///   状态假装查到了**。
+  Future<KeepaliveStatus?> keepaliveStatus() async {
+    try {
+      final m = await _channel.invokeMapMethod<String, dynamic>('keepaliveStatus');
+      if (m == null || m['ok'] != true) return null;
+      return KeepaliveStatus.fromMap(m);
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// 上次 run 是否被系统停止；`killedAt` = 毫秒时间戳（0 = 无记录）。
+  Future<({bool killed, int killedAt})> processKilled() async {
+    try {
+      final m = await _channel.invokeMapMethod<String, dynamic>('processKilled');
+      if (m == null) return (killed: false, killedAt: 0);
+      return (
+        killed: (m['killed'] as bool?) ?? false,
+        killedAt: (m['killedAt'] as int?) ?? 0,
+      );
+    } on MissingPluginException {
+      return (killed: false, killedAt: 0);
+    } on PlatformException {
+      return (killed: false, killedAt: 0);
+    }
+  }
+
+  /// **自动化任务真调度**（V0.4 T1-5，2026-11-02）。
+  ///
+  /// Kotlin 侧用 **AlarmManager** 注册周期闹钟（无新依赖）；到点**只发通知 + 写 pending 标记**，
+  /// **不假装跑了 agent** —— 真正执行由 App 打开后 Dart 侧发起（进程死可恢复）。
+  ///
+  /// · [saveAutomationTasks]：保存任务清单（JSON 字符串）并重注册闹钟；
+  /// · [loadAutomationTasks]：读回任务清单；
+  /// · [consumePendingAutomation]：取出"到点待执行"的任务 id 列表（并清空）。
+  Future<bool> saveAutomationTasks(String tasksJson) async {
+    try {
+      final m = await _channel.invokeMapMethod<String, dynamic>(
+        'automationSave',
+        {'tasks': tasksJson},
+      );
+      return m?['ok'] == true;
+    } on MissingPluginException {
+      return false; // 旧宿主没有该方法 ⇒ 如实失败
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  Future<String> loadAutomationTasks() async {
+    try {
+      final m = await _channel.invokeMapMethod<String, dynamic>('automationLoad');
+      return (m?['tasks'] as String?) ?? '[]';
+    } on MissingPluginException {
+      return '[]';
+    } on PlatformException {
+      return '[]';
+    }
+  }
+
+  Future<List<String>> consumePendingAutomation() async {
+    try {
+      final m = await _channel
+          .invokeMapMethod<String, dynamic>('automationConsumePending');
+      return ((m?['taskIds'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .toList(growable: false);
+    } on MissingPluginException {
+      return const [];
+    } on PlatformException {
+      return const [];
+    }
+  }
+
+  /// 提示消费后清标记（避免每次打开都提示）。
+  Future<void> consumeProcessKilled() async {
+    try {
+      await _channel.invokeMethod('consumeProcessKilled');
+    } on MissingPluginException {
+      // 旧宿主没有这个方法 ⇒ 忽略
+    } on PlatformException {
+      // 忽略
     }
   }
 
@@ -300,14 +490,108 @@ class AgentBridge {
   ///
   /// 返回 null 表示用户取消，或选的位置没有本地路径
   /// （例如选了网盘 —— 那时无法用普通 File IO 写入）。
-  Future<Map<String, dynamic>?> pickWorkspace() async {
+  /// ## 为什么要带 requestId + 超时（2026-11-02 T0 修复）
+  ///
+  /// SAF 选择器在前台时，本 Activity 可能被系统回收重建。旧实现有两个叠加的
+  /// 死角，合起来就是用户报的"选完文件夹返回 ⇒ 黑屏"：
+  ///
+  /// 1. Kotlin 侧 pending 回调挂在 **Activity 实例**上 ⇒ 重建后新实例没有
+  ///    收件人，选好的结果被静默丢弃；
+  /// 2. Dart 侧这里**没有超时** ⇒ 上面那条一旦发生，这个 `await` 永久挂起，
+  ///    UI 就那么卡着。
+  ///
+  /// 现在：
+  /// - 每次调用生成 [requestId]，Kotlin 用它做**进程级**登记的键（Activity
+  ///   重建后仍能对上）；
+  /// - 等待超过 [hb.ContractFolderPicker.timeoutSeconds] 就**先回收**结果
+  ///   （[_consumePickWorkspaceResult]）—— 因为 Kotlin 可能在我们超时之后
+  ///   才把结果交回来，直接报失败会把"其实选成功了"误判成失败；
+  /// - 回收不到才抛 [AgentBridgeException]，带上人话提示（重试 / 换默认工作区）。
+  ///
+  /// [timeout] 仅供测试注入更短的超时；生产不传，用契约常量。
+  ///
+  /// ## ★★ 超时只计**前台**时间（2026-11-02 真机纠错）★★
+  ///
+  /// 第一版直接 `future.timeout(45s)`，真机一测就露馅：
+  ///
+  /// ```
+  /// 18:27:25.936  startActivityForResult 已发出
+  /// 18:28:35.514  onActivityResult req=18502 res=-1 data=true   ← 结果好好的
+  /// ```
+  ///
+  /// 系统选择器在前台停留了 **70 秒**（logcat：`visible->invisible(70217ms)`），
+  /// 于是 45 秒一到 Dart 就报「选择结果已丢失」，可用户**还在挑目录**。
+  /// 结果最后也真的登记成功了 —— UI 却在撒谎说失败。
+  ///
+  /// 计时器不该把"用户在系统选择器里挑文件夹"算作"我们的等待"。
+  /// ⇒ 改成 [_ForegroundDeadline]：App 一进后台（选择器盖住我们）就停表，
+  /// 回到前台再接着走。45 秒的真实含义变成「用户对着我们自己的界面干等 45 秒」，
+  /// 那才是需要兜底的情况。
+  Future<Map<String, dynamic>?> pickWorkspace({Duration? timeout}) async {
+    // requestId 只用于**同一次调用**的配对，不需要全局唯一性，微秒时间戳足够
+    // （同一时刻不可能发起两次选目录）。
+    final requestId = 'pk_${DateTime.now().microsecondsSinceEpoch}';
+    final limit =
+        timeout ?? const Duration(seconds: hb.ContractFolderPicker.timeoutSeconds);
+
+    final done = Completer<Map<String, dynamic>?>();
+    final deadline = _ForegroundDeadline(limit, () {
+      if (!done.isCompleted) {
+        done.completeError(TimeoutException('pickWorkspace', limit));
+      }
+    })..start();
+
+    // 通道回包 → 完成等待。**不 await**：先让 deadline 与回包并行跑。
+    _channel
+        .invokeMapMethod<String, dynamic>('pickWorkspace', {
+          'requestId': requestId,
+        })
+        .then(
+      (m) {
+        if (!done.isCompleted) done.complete(m?.cast<String, dynamic>());
+      },
+      onError: (Object e, StackTrace st) {
+        if (!done.isCompleted) done.completeError(e, st);
+      },
+    );
+
     try {
-      final m = await _channel.invokeMapMethod<String, dynamic>('pickWorkspace');
-      return m?.cast<String, dynamic>();
+      return await done.future;
+    } on TimeoutException {
+      // 超时 ≠ 失败：先问 Kotlin 要这次请求已产出的结果。
+      final recovered = await _consumePickWorkspaceResult(requestId);
+      if (recovered != null) return recovered;
+      throw const AgentBridgeException(hb.ContractFolderPicker.timeoutMessage);
     } on PlatformException catch (e) {
       throw AgentBridgeException(e.message ?? e.code);
     } on MissingPluginException {
       throw const AgentBridgeException('桥接未就绪');
+    } finally {
+      deadline.cancel();
+    }
+  }
+
+  /// 取回某个 `requestId` 已完成但**没送达**的选择结果（超时后的补救）。
+  ///
+  /// 通道方法由 Kotlin 侧 `MainActivity` 提供；旧版本 App / 纯单测环境没有这个
+  /// 方法 ⇒ [MissingPluginException]，返回 null 走超时错误分支，**不抛**。
+  Future<Map<String, dynamic>?> _consumePickWorkspaceResult(
+    String requestId,
+  ) async {
+    try {
+      final m = await _channel
+          .invokeMapMethod<String, dynamic>(hb.ContractFolderPicker.recoverMethod, {
+            'requestId': requestId,
+          })
+          .timeout(
+            const Duration(
+              seconds: hb.ContractFolderPicker.recoverTimeoutSeconds,
+            ),
+          );
+      return m?.cast<String, dynamic>();
+    } catch (_) {
+      // 回收本身失败不该盖住"超时"这个主因，交给上层给出超时提示。
+      return null;
     }
   }
 
@@ -591,6 +875,10 @@ class AgentBridge {
       sessionStore: SessionStore(workspaceRoot: workspacePath),
       askGate: askGate,
     );
+    // ★ V0.4 T0-2（2026-11-02）：注入"上次 run 被系统停止"的探针（构造后赋值 ——
+    //   测试工厂类型只有 4 个参数，不能加构造参数）。
+    executor.processKilledProbe = processKilled;
+    executor.processKilledConsume = consumeProcessKilled;
     _currentAskGate = askGate;
 
     try {
@@ -717,6 +1005,26 @@ class AgentBridge {
   /// //    它们与传输方式无关，是产品约束。
   /// ```
   /// ~endkeep~
+
+  /// **V0.4 手动续跑入口**（契约 N14）：同一会话再跑一轮。
+  ///
+  /// 语义：用户点「继续」= 明确同意继续消耗 token；实现上是**一条可见的
+  /// 用户消息**（“继续未完成的任务”）+ 正常 run —— 历史保持 append-only，
+  /// 不伪造“自动续跑”那种不可见用户行。自动续跑（`ContinuePolicy.auto`）
+  /// 由 `LocalAgentExecutor` 内部 continuation 处理，不调用本方法。
+  Future<AgentRunResult> continueRun({
+    required String workspacePath,
+    required AppSettings settings,
+    required String sessionId,
+    String treeUri = '',
+  }) =>
+      run(
+        workspacePath: workspacePath,
+        request: '继续未完成的任务',
+        settings: settings,
+        sessionId: sessionId,
+        treeUri: treeUri,
+      );
 
   /// **停止当前在跑的那一轮**（2026-10-13）。
   ///
@@ -1891,6 +2199,16 @@ class AgentEvent {
     this.stopReason,
     this.turnCount,
     this.message,
+    this.runStopReason,
+    this.runStopRound,
+    this.runStopMaxRounds,
+    this.runStopTokensSpent,
+    this.runStopTokensLimit,
+    this.runStopNextEstimate,
+    this.runStopCanContinue,
+    this.runStopChangedFiles = const <String>[],
+    this.runStopErrorSummary,
+    this.runStopResumedFromRound,
     this.stepId,
     this.title,
     this.delta,
@@ -2012,6 +2330,20 @@ class AgentEvent {
   /// `failed`：错误信息
   final String? message;
 
+  // ---- V0.4 `run_stopped`（N14；只增字段）----
+  /// 停止原因 wire 名（max_rounds/token_budget/no_progress/provider_timeout/
+  /// network/process_killed/context_compress_failed/user_cancel）。
+  final String? runStopReason;
+  final int? runStopRound;
+  final int? runStopMaxRounds;
+  final int? runStopTokensSpent;
+  final int? runStopTokensLimit;
+  final int? runStopNextEstimate;
+  final bool? runStopCanContinue;
+  final List<String> runStopChangedFiles;
+  final String? runStopErrorSummary;
+  final int? runStopResumedFromRound;
+
   // ---- token 级（2026-10-12 流式逐字；见 Kotlin 侧 `AgentEvent` 的
   //      "token 级事件" 段与 `docs/25-流式工作步骤.md` §5.3）----
 
@@ -2129,6 +2461,10 @@ class AgentEvent {
   static const kBlocked = 'blocked';
   static const kFinished = 'finished';
   static const kFailed = 'failed';
+
+  /// **V0.4 长任务被策略停下**（N14）：不是完成、也不是普通错误；
+  /// 后面可能紧跟 `failed`，UI 用 `runStopCanContinue` 决定“继续”是否可用。
+  static const kRunStopped = 'run_stopped';
 
   /// **用户插话被注入会话**（2026-10-13，思考间隙引导）——
   /// 到达时机 = 上一轮完整结束、下一轮开始前。
@@ -2252,6 +2588,7 @@ class AgentEvent {
     kBlocked,
     kFinished,
     kFailed,
+    kRunStopped,
     kInterrupted,
     kPlanCreated,
     kPlanAdvanced,
@@ -2404,6 +2741,7 @@ class AgentRunResult {
     this.sessionId,
     this.cancelled = false,
     this.changeFiles,
+    this.failureReason,
   });
 
   final String stopReason;
@@ -2460,6 +2798,12 @@ class AgentRunResult {
   /// 空 `finalText` 当成"模型回答完了" —— 那会显示一条空回复。
   final bool cancelled;
 
+  /// **本轮失败的人话原因**（V0.4 T0，2026-11-02）。
+  ///
+  /// `null` = 成功/取消/后端未上报；非 null 时 UI **必须**在会话流里显示，
+  /// 不能只闪一下红条或只写「运行失败」。来源 = 事件流里的 `kFailed.message`。
+  final String? failureReason;
+
   factory AgentRunResult.fromMap(Map<String, dynamic> m) {
     final rawTurns = (m['turns'] as List?) ?? const [];
     return AgentRunResult(
@@ -2477,6 +2821,7 @@ class AgentRunResult {
       taskWallMs: (m['taskWallMs'] as num?)?.toInt() ?? 0,
       sessionId: m['sessionId'] as String?,
       cancelled: (m['cancelled'] as bool?) ?? false,
+      failureReason: m['failureReason'] as String?,
     );
   }
 }
@@ -2570,6 +2915,60 @@ class AgentTurn {
   }
 }
 
+/// **保活状态聚合**（`keepaliveStatus` 的 Dart 形状）。
+///
+/// ## 全字段可空是刻意的
+///
+/// 宿主"没给"的字段必须保持 null —— 这与"查到了、值是 false"是两回事。
+/// 把缺字段补成 `false`，UI 就会把"查不到"渲染成"没在跑/没忽略"，
+/// 那是编数据（`docs/INTERFACE.md` §N18.1 的"缺的不编"）。
+class KeepaliveStatus {
+  const KeepaliveStatus({
+    this.foregroundServiceRunning,
+    this.batteryIgnored,
+    this.batteryNote,
+    this.autostart,
+  });
+
+  /// 前台服务是否在跑（`AgentChatService.running` 真实位；null = 宿主没给）。
+  final bool? foregroundServiceRunning;
+
+  /// 是否已忽略电池优化（`PowerManager` 真实值；null = 宿主没给）。
+  final bool? batteryIgnored;
+
+  /// 口径差异提醒（如 MIUI「无限制」≠ 白名单）或读取失败原因；null = 没有提醒。
+  final String? batteryNote;
+
+  /// 当前品牌的自启动路径（null = 宿主没给/通用兜底也没拿到）。
+  final ({String brand, String path})? autostart;
+
+  /// 宽松解析：**缺的字段就是 null**（不做任何默认值补偿）。
+  factory KeepaliveStatus.fromMap(Map<String, dynamic> m) {
+    final auto = m['autostart'];
+    final ({String brand, String path})? autostart;
+    if (auto is Map) {
+      final brand = (auto['brand'] as String?) ?? '';
+      final path = (auto['path'] as String?) ?? '';
+      autostart =
+          (brand.isEmpty || path.isEmpty) ? null : (brand: brand, path: path);
+    } else {
+      autostart = null;
+    }
+    return KeepaliveStatus(
+      foregroundServiceRunning: m['foregroundServiceRunning'] as bool?,
+      batteryIgnored: m['batteryIgnored'] as bool?,
+      batteryNote: m['batteryNote'] as String?,
+      autostart: autostart,
+    );
+  }
+
+  @override
+  String toString() =>
+      'KeepaliveStatus(fg: $foregroundServiceRunning, battery: $batteryIgnored, '
+      'note: ${batteryNote == null ? '-' : '有'}, '
+      'autostart: ${autostart == null ? '-' : autostart!.brand})';
+}
+
 /// 工具在一轮里的**三态**（对应 Kotlin 侧 `ToolState`）。
 ///
 /// **被拦截 ≠ 失败** —— 这是 H-1 的根源，也是本枚举存在的理由。
@@ -2595,4 +2994,121 @@ enum ToolState {
         'none' => ToolState.none,
         _ => null,
       };
+}
+
+/// **只在前台走表的一次性超时**（2026-11-02 · T0 真机纠错）。
+///
+/// ## 为什么不能用 `Future.timeout`
+///
+/// 真机 logcat 摆在那儿：
+///
+/// ```
+/// 18:27:25.936  [heracles][picker] startActivityForResult 已发出
+/// 18:28:35.514  HeraclesAct: onActivityResult req=18502 res=-1 data=true
+/// ```
+///
+/// 结果**好好地回来了**（`res=-1` = RESULT_OK，`data` 非空），但系统选择器在前台
+/// 停留了 **70 秒**（`SmartPower: visible->invisible(70217ms)`）——
+/// `Future.timeout(45s)` 早在 45 秒时就判了死刑，UI 于是弹出
+/// 「系统回收了文件夹选择器，选择结果已丢失」，可工作区其实登记成功了。
+///
+/// **这不是"超时太长/太短"的问题，是计时口径错了**：用户在系统选择器里挑文件夹，
+/// 不该算作"我们的界面在干等"。
+///
+/// ⇒ App 进后台（选择器盖住我们）就停表，回到前台再接着走。
+/// 于是 45 秒的真实含义是「用户对着**我们自己的界面**干等 45 秒」，那才该兜底。
+class _ForegroundDeadline {
+  _ForegroundDeadline(this.total, this.onExpire);
+
+  final Duration total;
+  final void Function() onExpire;
+
+  Timer? _timer;
+  _DeadlineObserver? _observer;
+  bool _done = false;
+
+  void start() {
+    // 没有 WidgetsBinding（纯 Dart 单测）时退化成普通计时器 —— 功能不变，只是
+    // 少了"后台停表"这层保护，而单测本来也不会切前后台。
+    try {
+      _observer = _DeadlineObserver(this);
+      WidgetsBinding.instance.addObserver(_observer!);
+    } catch (_) {
+      _observer = null;
+    }
+    // ★ 按**当前**生命周期决定是否起表：调用点可能正好在后台
+    //   （例如用户刚切回来、结果还没到）。`lifecycleState == null` 表示
+    //   binding 还没收到第一次状态（冷启动早期）—— 按前台处理。
+    final state = _currentLifecycle();
+    if (state == null || state == AppLifecycleState.resumed) {
+      _arm();
+    }
+  }
+
+  AppLifecycleState? _currentLifecycle() {
+    if (_observer == null) return null;
+    try {
+      return WidgetsBinding.instance.lifecycleState;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _arm() {
+    if (_done) return;
+    _timer?.cancel();
+    _timer = Timer(total, () {
+      if (_done) return;
+      _done = true;
+      onExpire();
+    });
+  }
+
+  void _disarm() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  /// 生命周期回调：**只有 `resumed` 才走表**。
+  ///
+  /// `inactive`（下拉通知栏、来电话）与 `paused`（选择器/相机盖住我们）都停表：
+  /// 这两种状态里用户根本没在等我们的回包。
+  void onLifecycle(AppLifecycleState state) {
+    if (_done) return;
+    if (state == AppLifecycleState.resumed) {
+      _arm();
+    } else {
+      _disarm();
+    }
+  }
+
+  void cancel() {
+    _done = true;
+    _disarm();
+    final o = _observer;
+    if (o != null) {
+      runCatchingRemoveObserver(o);
+      _observer = null;
+    }
+  }
+
+  static void runCatchingRemoveObserver(WidgetsBindingObserver o) {
+    try {
+      WidgetsBinding.instance.removeObserver(o);
+    } catch (_) {
+      // binding 已销毁（测试收尾）—— 忽略
+    }
+  }
+}
+
+/// 把 App 生命周期转给 [_ForegroundDeadline] 的观察者。
+class _DeadlineObserver with WidgetsBindingObserver {
+  _DeadlineObserver(this.owner);
+
+  final _ForegroundDeadline owner;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    owner.onLifecycle(state);
+  }
 }

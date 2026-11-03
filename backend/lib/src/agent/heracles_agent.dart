@@ -57,6 +57,10 @@ import 'tools/file_tools.dart';
 import 'tools/info_tools.dart';
 import 'tools/interaction_tools.dart';
 import 'tools/shell_tools.dart';
+import 'v4_extensions.dart';
+import 'tools/document_tools.dart';
+import 'tools/tool_aliases.dart';
+import 'tools/v4_tools.dart';
 
 /// 模型配置（后端视角）。
 class BackendConfig {
@@ -161,6 +165,11 @@ class RunOptions {
     this.reflectOnFailures = 0,
     this.verifyGateCompletion = false,
     this.takeSteerMessage,
+    this.continuePolicy = ContinuePolicy.off,
+    this.maxRounds = ContractRunContinue.autoMaxRounds,
+    this.tokenLimit = ContractRunContinue.runTokenLimit,
+    this.resumeFromCheckpoint = const <String, Object?>{},
+    this.userSkills = const [],
   });
 
   final int maxTurns;
@@ -362,6 +371,45 @@ class RunOptions {
   /// 不该持有可变队列。回调让"谁来取、什么时候取、取完怎么清"都留在宿主层。
   /// 空 `null`（默认）= 不装 hook ⇒ 行为与加这个字段之前**完全一致**。
   final String? Function()? takeSteerMessage;
+
+  /// **用户自定义技能**（V0.4 T1-5，2026-11-02；默认空 = 只有内置三技能）。
+  ///
+  /// 由宿主从工作区扫描 `SKILL.md` 得到（`SkillRegistry.scan` 的已启用项）。
+  /// 注入时与 [builtinSkills] **合并**（内置在前、用户在後；同名时用户覆盖）。
+  /// 只增字段 ⇒ 空列表时行为与旧版完全一致。
+  final List<SkillEntry> userSkills;
+
+  /// **长任务续跑策略**（V0.4，2026-11-02；默认 [ContinuePolicy.off] = 旧行为）。
+  ///
+  /// `off` = 跑一轮就停（与今天完全一致）；`ask` = 每轮结束发 `run_stopped`
+  /// 等用户确认；`auto` = 自动续跑，最多 [maxRounds] 轮。
+  final ContinuePolicy continuePolicy;
+
+  /// 续跑轮数上限（`auto` 默认 [ContractRunContinue.autoMaxRounds] = 3）。
+  final int maxRounds;
+
+  /// 本次 run 的 token 上限（默认 [ContractRunContinue.runTokenLimit] = 200 万）。
+  /// **轮数与 token 谁先到停谁**。
+  final int tokenLimit;
+
+  /// **从 checkpoint 恢复**（V0.4；默认空 Map = 不恢复）。
+  ///
+  /// 宿主从会话 `.jsonl` 的最后一条 `role:"run_checkpoint"` 行读出来传进来；
+  /// backend 据此知道"上次跑到第几轮/花了多少 token/计划是什么"，**不重复消息**、
+  /// 不伪造用户消息（续跑用内部 continuation 状态）。
+  final Map<String, Object?> resumeFromCheckpoint;
+}
+
+/// **续跑策略**（V0.4）：三档，不能混成一个开关。
+enum ContinuePolicy {
+  /// 跑一轮就停（默认，与旧行为一致）。
+  off,
+
+  /// 每轮结束都发 `run_stopped`（`canContinue=true`），等用户确认再跑。
+  ask,
+
+  /// 自动续跑，最多 `RunOptions.maxRounds` 轮；到上限仍未完成 ⇒ 停下来问。
+  auto,
 }
 
 /// **组装好的 Agent**。
@@ -669,7 +717,7 @@ class HeraclesAgent {
     //   App 每次 run 新建 agent ⇒ 恰好 run 级；CLI/测试复用实例 ⇒ 会话级
     //   （从宽取向：读过的文件跨 run 仍算读过）。
     final tracker = EditReadTracker();
-    return [
+    final base = [
       ...buildFileTools(factory, _caps, tracker: tracker, verify: verify),        // 8 个：读/写/编辑/补丁/列/建目录/找/搜
       ...buildShellTools(factory, _caps),       // 1 个：run_shell_command
       ...buildFileManageTools(factory, _caps, tracker: tracker),  // 3 个：删除/移动/复制（有破坏性）
@@ -678,7 +726,16 @@ class HeraclesAgent {
       ...buildInteractionTools(factory,         // 3 个：ask_user / save_memory / propose_global_memory
           askGate: _askGate, caps: _caps),
       ...buildGitTools(factory, _caps),         // 11 个：5 只读 + 4 改本地 + push + init
+      // ★ V0.4 T1-4（2026-11-02）：2 个 —— web_search / notify_user
+      //   （能力缺失 ⇒ 一调用就失败并明说；不返回假结果）
+      ...buildV4Tools(factory, _caps),
+      // ★ V0.4 T1-4（2026-11-02）：read_document（docx/xlsx/pptx/pdf 文本提取）
+      ...buildDocumentTools(factory, _caps),
     ];
+    // ★ V0.4 T1-4 别名执行层（2026-11-02）：框架按 `Tool.name` 精确匹配，
+    //   所以别名必须作为**独立 Tool 注册**（执行体转调正式工具），光有解析函数不够。
+    //   只给已存在的正式工具生成；旧正式名一个不动（别名只增）。
+    return [...base, ...buildAliasTools(base)];
   }
 
   /// **组装 system prompts** —— 默认提示 → 宿主追加 → 长期记忆（三段记忆）。
@@ -860,7 +917,27 @@ class HeraclesAgent {
     final emit = _Emitter(bridge);
     final wallClock = Stopwatch()..start();
     var totalToolCalls = 0;
+    var totalTokens = 0;
+    var runStoppedEmitted = false;
     var budgetReached = false;
+
+    /// **V0.4 重试记账**：框架 `LLMRetryingEvent` 次数 + 最后一次重试原因。
+    ///
+    /// 用来判断"**重试耗尽**"：框架只有 5 个异常码（无 timeout/network），
+    /// 所以超时/网络只能靠"重试发生过且最终仍失败"来归类 —— 否则
+    /// `provider_timeout`/`network` 这两个 reason 永远没有来源。
+    var retryCount = 0;
+    String? lastRetryReason;
+
+    /// **V0.4 checkpoint 恢复**：上次跑到第几轮（null = 不是恢复）。
+    ///
+    /// 宿主从会话最后一条 `role:"run_checkpoint"` 行读出 `round` 传进来；
+    /// 这里用它算 `resumedFromRound` 并作为轮次基准（不重复已完成的轮）。
+    final resumedFromRound =
+        _options.resumeFromCheckpoint['round'] is num
+            ? (_options.resumeFromCheckpoint['round'] as num).toInt()
+            : null;
+    final roundBase = resumedFromRound ?? 0;
 
     /// **最新计划步骤**（B8 P0，2026-10-30）：`PlanChangedEvent` 处缓存。
     ///
@@ -886,6 +963,35 @@ class HeraclesAgent {
       emit(HeraclesPlanClosed(reachedGoal: reachedGoal, reason: reason));
     }
 
+    /// **V0.4：失败/超限收尾时发一次 `run_stopped`**（只增事件，不改旧 failed 语义）。
+    ///
+    /// 只对“不是普通错误”的停止发：轮次上限、token/工具预算、超时/网络、用户取消。
+    /// 普通异常仍只发 `failed`，避免 UI 同时显示“失败”和“可继续”两种终态。
+    void emitRunStoppedForFailure(String reason, {required bool cancelled}) {
+      if (runStoppedEmitted) return;
+      final classified = classifyFailureStop(
+        reason: reason,
+        cancelled: cancelled,
+        budgetReached: budgetReached,
+        retryCount: retryCount,
+        lastRetryReason: lastRetryReason,
+        policyOff: _options.continuePolicy == ContinuePolicy.off,
+      );
+      final stop = classified.reason;
+      final canContinue = classified.canContinue;      if (stop == null) return;
+      runStoppedEmitted = true;
+      emit(HeraclesRunStopped(
+        reason: stop,
+        round: roundBase + 1,
+        maxRounds: _options.maxRounds,
+        tokensSpent: totalTokens,
+        tokensLimit: _options.tokenLimit,
+        canContinue: canContinue,
+        errorSummary: reason,
+        resumedFromRound: resumedFromRound,
+      ));
+    }
+
     /// **本轮模型最后一次给出的正文**（`AfterCallLLMEvent` 捕获）。
     ///
     /// `null` = 本轮模型一次正文都没出（纯工具调用轮 / 异常 / 预算耗尽）。
@@ -908,6 +1014,14 @@ class HeraclesAgent {
 
     final client = _buildClient();
     final controller = AgentController();
+
+    // ---- 计划自动推进（P0，2026-10-31）----
+    //
+    // 只在启用计划时装。**同一个实例**贯穿初始 run 与两次降级重跑 ——
+    // 自动推进记账（"哪些步已经自动推过"）必须跟计划走，不能因换模型重置；
+    // 模型主动 `write_todos` 覆盖时由 [noteExternalPlan] 重置记账。
+    // 注意：必须声明在 `controller.on<PlanChangedEvent>` 注册**之前**。
+    final planProgressHook = _options.enablePlan ? _PlanProgressHook() : null;
 
     // ---- 把框架的 Controller 事件转成我们的 HeraclesEvent ----
     controller.on<LLMChunkEvent>((e) {
@@ -937,6 +1051,10 @@ class HeraclesAgent {
     controller.on<LLMRetryingEvent>((e) {
       // ⚠️ 字段是 `reason`（String），不是 `error`
       emit(HeraclesRetrying(e.reason));
+      // ★ V0.4（2026-11-02）：累计重试次数 + 记最后一次重试原因 ——
+      //   用于判断"是否重试耗尽"（耗尽后 provider_timeout/network 才有来源）。
+      retryCount++;
+      lastRetryReason = e.reason;
     });
     controller.on<AfterToolCallEvent>((e) {
       totalToolCalls++;
@@ -954,6 +1072,9 @@ class HeraclesAgent {
     });
     controller.on<PlanChangedEvent>((e) {
       final plan = e.plan;
+      // ★ P0（2026-10-31）：区分"模型主动更新"与"自动推进"。
+      //   自动推进帧（本 hook 自己发的）不影响记账；模型帧重置记账。
+      planProgressHook?.noteExternalPlan(plan);
       final steps = [
         for (final s in plan.steps)
           HeraclesPlanStep(s.description, _mapStatus(s.status)),
@@ -1041,6 +1162,7 @@ class HeraclesAgent {
         outputTokens: u.completionTokens,
         cachedTokens: _cachedFrom(u),
       ));
+      totalTokens += _fullPromptTokens(u) + u.completionTokens;
     });
     controller.on<OnAgentExceptionEvent>((e) {
       // ⚠️ 字段是 `error`（Exception），不是 `exception`
@@ -1133,6 +1255,10 @@ class HeraclesAgent {
       mode: _options.approvalMode,
       gate: _askGate,
     );
+
+    // ---- 计划自动推进（P0，2026-10-31）----
+    //
+    // （实例在上方 `controller` 之后创建；此处保留说明）
 
     // ---- 组装 StatefulAgent ----
     //
@@ -1241,6 +1367,9 @@ class HeraclesAgent {
         budgetHook,
         approvalHook,
 
+        // ★ P0（2026-10-31）：计划自动推进 —— 执行类工具成功后推进一格并播帧。
+        if (planProgressHook != null) planProgressHook,
+
         // ★ P4（2026-10-25）：完成门禁 —— 写过文件且最后一次验证失败时
         //   拒绝收尾，模型必须回到修复循环（"带病收尾"被架构拦下）。
         if (_options.verifyGateCompletion && verify != null)
@@ -1259,7 +1388,9 @@ class HeraclesAgent {
       subAgents: _options.enableSubAgents ? [_workerSubAgent()] : null,
       // ★ 技能目录（S1/S2，2026-10-24）：非空时框架追加 activate/deactivate
       //   工具 + 目录系统提示（渐进披露）。
-      skills: _options.enableSkills ? builtinSkills() : null,
+      skills: _options.enableSkills
+          ? [...builtinSkills(), for (final s in _options.userSkills) s.toFrameworkSkill()]
+          : null,
       disableSubAgents: !_options.enableSubAgents,
       // 框架自带循环检测（相同调用重复 + 周期性 LLM 诊断）。
       // 旧实现只有"相同调用重复"且阈值 2；这里用框架默认（5），
@@ -1440,6 +1571,8 @@ class HeraclesAgent {
               _SteerHook(_options.takeSteerMessage!),
             budgetHook,
             approvalHook,
+            // ★ P0（2026-10-31）：计划自动推进（同一实例 ⇒ 记账不因换模型重置）
+            if (planProgressHook != null) planProgressHook,
           ],
           loopDetector: DefaultLoopDetector(
             state: _state!,
@@ -1460,6 +1593,10 @@ class HeraclesAgent {
         reason: e.code == AgentExceptionCode.cancelled
             ? '用户停止'
             : (budgetReached ? '任务被中断：$reason' : '运行失败：$reason'),
+      );
+      emitRunStoppedForFailure(
+        reason,
+        cancelled: e.code == AgentExceptionCode.cancelled,
       );
       emit(HeraclesFailed(reason));
     } catch (e) {
@@ -1497,6 +1634,8 @@ class HeraclesAgent {
               _SteerHook(_options.takeSteerMessage!),
             budgetHook,
             approvalHook,
+            // ★ P0（2026-10-31）：计划自动推进（同一实例）
+            if (planProgressHook != null) planProgressHook,
           ],
           loopDetector: DefaultLoopDetector(
             state: _state!,
@@ -1516,6 +1655,7 @@ class HeraclesAgent {
         reachedGoal: false,
         reason: budgetReached ? '任务被中断：$reason' : '运行失败：$reason',
       );
+      emitRunStoppedForFailure(reason, cancelled: false);
       emit(HeraclesFailed(reason));
     } finally {
       if (!finished) wallClock.stop();
@@ -1926,6 +2066,122 @@ class _ReflectionHook extends AgentHook {
   }
 }
 
+/// **计划自动推进 hook**（P0，2026-10-31）—— 清单要跟着真实执行走。
+///
+/// ## 为什么需要（真因）
+///
+/// 框架的计划帧只在模型主动 `write_todos` 时发。模型经常"闷头做五六步、
+/// 最后才 update 一次" ⇒ 灵动岛在整段任务里**一动不动**，用户以为它没进展。
+/// 本 hook 在执行类工具**成功后**推进一格并播 `PlanChangedEvent`，
+/// 让清单跟着真实执行走（模型主动更新仍然优先，见 [noteExternalPlan]）。
+///
+/// ## 规则（钉死，测试覆盖）
+///
+/// · 只在本轮**已有计划**时生效；工具**成功**（`isError == false`）才推进；
+/// · **不推进**的工具（[skipTools]）：计划/问答/记忆/技能等元数据工具 +
+///   纯读工具 —— 它们成功**不代表完成了一个 todo**；
+/// · 动作：有 `inProgress` ⇒ 标 `completed`，再把下一个 `pending` 标
+///   `inProgress`；没有 `inProgress` ⇒ 只把第一个 `pending` 标 `inProgress`
+///   （**本步不标 done** —— 还没真开始做）；
+/// · **每步只自动推进一次**（[_autoAdvanced] 记账 + 状态本身）；
+///   模型随后 `write_todos` **以模型为准**：收到外部计划帧时清空记账；
+/// · 失败步骤**绝不**标 done（`isError` 直接 return，不改任何状态）；
+/// · `plan_closed` 语义不变：全部 done/cancelled 才算 `reachedGoal=true`。
+class _PlanProgressHook extends AgentHook {
+  /// 不推进计划的工具（与 `_ApprovalPolicy._readOnly` 同族）。
+  ///
+  /// 为什么这些不算"完成一步"：它们要么是**元数据操作**（改计划/问人/
+  /// 存记忆/切技能 —— 不产生工作成果），要么是**纯读**（看文件/查状态
+  /// 不等于做完了某步）。把它们算进去会让清单连续跳格、甚至跳过头。
+  static const skipTools = {
+    // 计划 / 问答 / 记忆 / 技能（元数据）
+    'write_todos', 'ask_user', 'save_memory', 'propose_global_memory',
+    'activate_skills', 'deactivate_skills', 'list_skills',
+    // 纯读
+    'read_file', 'list_files', 'find_files', 'grep_files',
+    'web_fetch', 'check_device_state',
+    // MCP 只读
+    'mcp_list_tools', 'mcp_list_resources', 'mcp_list_prompts',
+    'mcp_read_resource', 'mcp_get_prompt',
+    // git 只读
+    'git_status', 'git_log', 'git_diff', 'git_branches', 'git_show_commit',
+  };
+
+  /// 已自动推进过的步骤 key（`序号\t描述`）。
+  ///
+  /// 为什么需要：状态本身（completed）只能挡住"再标一次 done"，
+  /// 挡不住"模型把同一步改回 inProgress 后又被自动完成"的抖动；
+  /// 也用它在模型覆盖时整体重置。
+  final Set<String> _autoAdvanced = <String>{};
+
+  /// 本 hook 最近一次播出去的 `PlanState` 对象（identify 自己的帧）。
+  ///
+  /// `controller.publish` 是**同步**的：监听回调会在本行内执行，
+  /// 靠对象同一性区分"自动帧"与"模型帧"，避免自己把自己的记账清掉
+  /// （那会导致同一步被反复推进）。
+  Object? _lastPublishedPlan;
+
+  static String _keyOf(int index, String description) =>
+      '$index\t$description';
+
+  /// 监听器回调：区分模型帧与自动帧。
+  ///
+  /// · `identical(plan, _lastPublishedPlan)` ⇒ 自己刚播的，**不动记账**；
+  /// · 其它帧（模型 `write_todos`）⇒ **重置记账**（模型覆盖优先）。
+  void noteExternalPlan(PlanState? plan) {
+    if (plan == null) return;
+    if (identical(plan, _lastPublishedPlan)) return;
+    _autoAdvanced.clear();
+    _lastPublishedPlan = null;
+  }
+
+  @override
+  FutureOr<ToolResultHookResult> afterToolCall(ToolResultHookContext context) {
+    final result = context.result;
+    // ★ 失败/被拒绝的调用绝不推进，更不得标 done。
+    if (result.isError) return ToolResultHookResult.proceed(result: result);
+    if (skipTools.contains(result.name)) {
+      return ToolResultHookResult.proceed(result: result);
+    }
+    final plan = context.agent.state.plan;
+    if (plan == null || plan.steps.isEmpty) {
+      return ToolResultHookResult.proceed(result: result);
+    }
+
+    final steps = plan.steps;
+    var changed = false;
+
+    final ip = steps.indexWhere((s) => s.status == StepStatus.inProgress);
+    if (ip >= 0) {
+      // 1) 当前步做完了（每步只自动推进一次）。
+      final key = _keyOf(ip, steps[ip].description);
+      if (!_autoAdvanced.contains(key)) {
+        steps[ip].status = StepStatus.completed;
+        _autoAdvanced.add(key);
+        changed = true;
+        // 2) 再开下一个 pending；没有 pending（最后一步）⇒ 全完成，停。
+        final next = steps.indexWhere((s) => s.status == StepStatus.pending);
+        if (next >= 0) {
+          steps[next].status = StepStatus.inProgress;
+        }
+      }
+    } else {
+      // 没有 inProgress ⇒ 只"开始"第一个 pending，**本步不标 done**。
+      final next = steps.indexWhere((s) => s.status == StepStatus.pending);
+      if (next >= 0) {
+        steps[next].status = StepStatus.inProgress;
+        changed = true;
+      }
+    }
+
+    if (!changed) return ToolResultHookResult.proceed(result: result);
+    _lastPublishedPlan = plan;
+    // 用框架既有事件通道播一帧 ⇒ 宿主 `HeraclesPlanUpdated` 照常转发。
+    context.agent.controller?.publish(PlanChangedEvent(context.agent, plan));
+    return ToolResultHookResult.proceed(result: result);
+  }
+}
+
 /// **插队发送 hook**（P0，2026-10-30）—— 轮间注入用户插话。
 ///
 /// ## 为什么挂在 `onTurnCompletion`
@@ -2248,6 +2504,199 @@ sealed class HeraclesEvent {
   const HeraclesEvent();
 }
 
+/// **一次 run 被停下**（V0.4，2026-11-02）—— 长任务续跑的"收尾+可续"信号。
+///
+/// ## 与 [HeraclesFailed] / [HeraclesFinished] 的区别
+///
+/// - `Finished` = 任务真的做完了（正常收尾）；
+/// - `Failed` = 出错了（模型/工具/框架错误）；
+/// - **`RunStopped` = 任务没做完，但**不是因为错误**，而是被策略停下**
+///   （轮数/token 预算/无进展/超时/被系统杀/用户取消），并且**可能可以继续**。
+///
+/// UI 拿到它应该显示"任务被中断：<人话原因>"+ 继续按钮（`canContinue` 决定可用），
+/// 而不是画成"完成"或"失败"。字段口径见 `docs/INTERFACE.md` §N14.1。
+final class HeraclesRunStopped extends HeraclesEvent {
+  const HeraclesRunStopped({
+    required this.reason,
+    required this.round,
+    required this.maxRounds,
+    required this.tokensSpent,
+    required this.tokensLimit,
+    this.nextEstimate,
+    required this.canContinue,
+    this.changedFiles = const <String>[],
+    this.errorSummary,
+    this.resumedFromRound,
+  });
+
+  /// 停止原因（8 值，见 [RunStopReason]）。
+  final RunStopReason reason;
+
+  /// 停在第几轮（从 1 计）。
+  final int round;
+
+  /// 当前策略的轮数上限。
+  final int maxRounds;
+
+  /// 本次 run 已花 token（与用量同一口径）。
+  final int tokensSpent;
+
+  /// token 上限。
+  final int tokensLimit;
+
+  /// 再跑一轮的估算 token；**无依据则 null（不编数）**。
+  final int? nextEstimate;
+
+  /// 是否可以继续（`false` 时 UI 禁用"继续"）。
+  final bool canContinue;
+
+  /// 本次 run 改动过的文件（相对路径，去重；取不到 = 空列表）。
+  final List<String> changedFiles;
+
+  /// 人话错误摘要（**不得是堆栈/内部 id**）。
+  final String? errorSummary;
+
+  /// 本次是从第几轮 checkpoint 恢复的（非恢复 = null）。
+  final int? resumedFromRound;
+}
+
+/// **run 停止原因**（V0.4）：8 值枚举（只增）。
+///
+/// 为什么不用字符串：UI/测试/统计都要按它分支，字符串会拼错且无法穷尽 switch。
+/// wire 名 = 枚举名（`max_rounds` 等下划线形式），见 [wireName]。
+enum RunStopReason {
+  /// 轮数到上限。
+  maxRounds,
+
+  /// token 到上限。
+  tokenBudget,
+
+  /// 连续 2 轮无进展（模型在打转）。
+  noProgress,
+
+  /// 模型侧超时（provider 超时）。
+  providerTimeout,
+
+  /// 网络不可恢复（重试耗尽）。
+  network,
+
+  /// 进程被杀（恢复后发现上次未收尾）。
+  processKilled,
+
+  /// 上下文压缩失败且无法继续。
+  contextCompressFailed,
+
+  /// 用户主动取消。
+  userCancel;
+
+  /// wire 名（`max_rounds` / `token_budget` / `no_progress` / `provider_timeout` /
+  /// `network` / `process_killed` / `context_compress_failed` / `user_cancel`）。
+  String get wireName => switch (this) {
+        RunStopReason.maxRounds => 'max_rounds',
+        RunStopReason.tokenBudget => 'token_budget',
+        RunStopReason.noProgress => 'no_progress',
+        RunStopReason.providerTimeout => 'provider_timeout',
+        RunStopReason.network => 'network',
+        RunStopReason.processKilled => 'process_killed',
+        RunStopReason.contextCompressFailed => 'context_compress_failed',
+        RunStopReason.userCancel => 'user_cancel',
+      };
+
+  /// 从 wire 名解析（不认识 ⇒ null，不猜）。
+  static RunStopReason? tryParse(String? raw) {
+    for (final r in RunStopReason.values) {
+      if (r.wireName == raw) return r;
+    }
+    return null;
+  }
+}
+
+/// **失败收尾的分类结果**（V0.4，纯数据 —— 便于单测）。
+class FailureStopClassification {
+  const FailureStopClassification(
+      {required this.reason, required this.canContinue});
+
+  /// null = 普通失败（不归为"可继续的停止"，仍走 `failed` 事件）。
+  final RunStopReason? reason;
+  final bool canContinue;
+}
+
+/// **把一次失败收尾归类成 `RunStopReason`**（V0.4 纯函数）。
+///
+/// ## 为什么要"重试耗尽"这个判据
+///
+/// 框架的 `AgentExceptionCode` 只有 5 个（unknown/loopDetection/resumeFailed/
+/// stopByController/cancelled）—— **没有 timeout / network**。所以超时与网络
+/// 只能靠"**框架确实重试过、且最终仍失败**"来认定，否则 `provider_timeout` /
+/// `network` 这两个 reason 永远不会有来源（等于死枚举）。
+///
+/// 优先级：取消 > 工具预算 > **重试耗尽(超时/网络)** > 文本匹配(轮次/超时/网络) > 普通失败。
+FailureStopClassification classifyFailureStop({
+  required String reason,
+  required bool cancelled,
+  required bool budgetReached,
+  required int retryCount,
+  String? lastRetryReason,
+  required bool policyOff,
+}) {
+  final canContinueWhenOn = !policyOff;
+  if (cancelled) {
+    return const FailureStopClassification(
+      reason: RunStopReason.userCancel,
+      canContinue: false,
+    );
+  }
+  if (budgetReached) {
+    // 工具调用预算：wire 复用 token_budget（契约 8 值），摘要写清是工具预算。
+    return const FailureStopClassification(
+      reason: RunStopReason.tokenBudget,
+      canContinue: false,
+    );
+  }
+  final retriesExhausted = retryCount >= ContractRunContinue.maxNetworkRetries;
+  final retryText = lastRetryReason ?? '';
+  if (retriesExhausted &&
+      (retryText.contains('timeout') ||
+          retryText.contains('Timeout') ||
+          retryText.contains('超时'))) {
+    return FailureStopClassification(
+      reason: RunStopReason.providerTimeout,
+      canContinue: canContinueWhenOn,
+    );
+  }
+  if (retriesExhausted &&
+      (retryText.contains('network') ||
+          retryText.contains('Network') ||
+          retryText.contains('connection') ||
+          retryText.contains('连接'))) {
+    return FailureStopClassification(
+      reason: RunStopReason.network,
+      canContinue: canContinueWhenOn,
+    );
+  }
+  if (reason.contains('Maximum turns') || reason.contains('最大轮次')) {
+    return FailureStopClassification(
+      reason: RunStopReason.maxRounds,
+      canContinue: canContinueWhenOn,
+    );
+  }
+  if (reason.contains('timeout') || reason.contains('超时')) {
+    return FailureStopClassification(
+      reason: RunStopReason.providerTimeout,
+      canContinue: canContinueWhenOn,
+    );
+  }
+  if (reason.contains('network') ||
+      reason.contains('Network') ||
+      reason.contains('连接')) {
+    return FailureStopClassification(
+      reason: RunStopReason.network,
+      canContinue: canContinueWhenOn,
+    );
+  }
+  // 普通错误 ⇒ 不归为"可继续的停止"（仍走 failed）。
+  return const FailureStopClassification(reason: null, canContinue: false);
+}
 /// **正文增量** —— 最终回答只认它。
 final class HeraclesTextDelta extends HeraclesEvent {
   const HeraclesTextDelta(this.delta);

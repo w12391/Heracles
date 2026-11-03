@@ -514,6 +514,46 @@ class DeviceWorkspaceCapability implements WorkspaceCapability {
     );
   }
 
+  // ------------------------------------------------------------------ readBytes
+
+  /// **读二进制文件**（V0.4 T1-4）：给 `read_document` 用（zip/PDF 需字节）。
+  ///
+  /// 走 `fs.readBytes`（Kotlin 侧有 `MAX_BINARY_BYTES` 硬上限）；
+  /// 通道缺失/读失败 ⇒ **明确失败**（不返回空 bytes 假装成功）。
+  @override
+  Future<CapabilityResult> readBytes(
+    String path, {
+    int maxBytes = 20 * 1024 * 1024,
+  }) async {
+    final abs = resolve(path);
+    if (abs == null) return _fail();
+    try {
+      final raw = await _ch.call('fs.readBytes', <String, Object?>{'path': abs});
+      final err = errorOf(raw);
+      if (err != null) return CapabilityFailure(err);
+      final bytes = raw['bytes'];
+      final list = bytes is List
+          ? [for (final b in bytes) if (b is int) b]
+          : const <int>[];
+      if (list.isEmpty) {
+        return const CapabilityFailure('读取二进制失败（通道未返回 bytes）');
+      }
+      if (list.length > maxBytes) {
+        return CapabilityFailure(
+          '文件过大（${list.length} 字节，上限 $maxBytes）——请先拆分',
+        );
+      }
+      return CapabilitySuccess(
+        '已读取 ${list.length} 字节',
+        metadata: {'bytes': list},
+      );
+    } on MissingPluginException {
+      return const CapabilityFailure('当前环境不支持二进制读取（通道缺失）');
+    } on PlatformException catch (e) {
+      return CapabilityFailure('读取二进制失败：${e.message ?? e.code}');
+    }
+  }
+
   // ------------------------------------------------------------------ write
 
   @override
@@ -2093,10 +2133,78 @@ class DeviceApkCapability implements ApkCapability {
 /// SSRF 闸（[checkUrl]）与文本抽取（[_htmlToText]）都不用动。
 /// 类名因此不叫 `DioWebCapability` —— 它内部确实没用 dio。
 class DeviceWebCapability implements WebCapability {
-  const DeviceWebCapability();
+  const DeviceWebCapability({this.searchEndpoint = ''});
+
+  /// **搜索服务 endpoint**（V0.4 T1-4；空 = 未配置）。
+  ///
+  /// 只有宿主显式配置了搜索服务才可用；未配置时 `search` **明确失败**
+  /// （"未配置搜索服务"），**绝不编造结果** —— 见 docs/接口.md §10.4。
+  ///
+  /// ⚠️ **免鉴权（2026-11-02 裁定）**：本能力**没有自定义请求头的位置**，
+  /// 当前版本只支持免鉴权的搜索服务。Key 注入（`headers` 缝）是下一轮任务，
+  /// 已登记在 `docs/INTERFACE.md` §N16.4 —— 在那之前不要在这里加"顺手带个
+  /// Key"的逻辑：存了发不出去，就是"已保存却不生效"的半截功能。
+  final String searchEndpoint;
 
   /// 最多跟几跳重定向。
   static const int _maxRedirects = 5;
+
+  /// **联网搜索**（V0.4 T1-4）。
+  ///
+  /// 未配置 endpoint ⇒ 明确失败（不编结果）。
+  /// 配置后：GET `endpoint?q=<query>&limit=<n>`，期望返回 JSON
+  /// `{"results":[{"title","snippet","url"}]}`；解析失败/网络失败都**如实失败**。
+  @override
+  Future<CapabilityResult> search(String query, {int limit = 5}) async {
+    final ep = searchEndpoint.trim();
+    if (ep.isEmpty) {
+      return const CapabilityFailure(
+        '尚未配置搜索服务：请在设置里填写搜索 endpoint 后重试'
+        '（当前版本仅支持免鉴权搜索服务，无需 API Key）。',
+        isRetryable: false,
+      );
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse(ep).replace(queryParameters: {
+        'q': query,
+        'limit': '$limit',
+      });
+    } catch (e) {
+      return CapabilityFailure('搜索 endpoint 非法：`$ep`（${_humanize(e)}）');
+    }
+    // 搜索 endpoint 也必须过 SSRF 闸（同一套纪律）
+    final rejection = await checkUrl(uri);
+    if (rejection != null) return CapabilityFailure(rejection, isRetryable: false);
+
+    final fetched = await _fetchRaw(uri);
+    if (fetched.error != null) {
+      return CapabilityFailure('搜索请求失败：${fetched.error}', isRetryable: true);
+    }
+    final body = _decodeBody(fetched.body, fetched.charset);
+    try {
+      final decoded = jsonDecode(body);
+      final results = decoded is Map ? decoded['results'] : null;
+      if (results is! List || results.isEmpty) {
+        return const CapabilityFailure('搜索服务返回空结果（没有可用条目）。');
+      }
+      final lines = <String>[];
+      for (final raw in results.take(limit)) {
+        if (raw is! Map) continue;
+        final title = (raw['title'] as String?)?.trim() ?? '';
+        final snippet = (raw['snippet'] as String?)?.trim() ?? '';
+        final url = (raw['url'] as String?)?.trim() ?? '';
+        if (url.isEmpty) continue; // ★ 没有来源的条目不展示（无法核对）
+        lines.add('${lines.length + 1}. $title\n   $snippet\n   来源：$url');
+      }
+      if (lines.isEmpty) {
+        return const CapabilityFailure('搜索服务返回的条目缺少来源 URL（无法核对，已丢弃）。');
+      }
+      return CapabilitySuccess(lines.join('\n'));
+    } catch (e) {
+      return CapabilityFailure('搜索服务返回格式不合法（${_humanize(e)}）。');
+    }
+  }
 
   /// 抓取网页并转成可读文本。
   @override
@@ -2454,6 +2562,43 @@ class DeviceWebCapability implements WebCapability {
     });
     return out;
   }
+
+  /// **联网搜索**：实现见类顶部 `search`（V0.4 T1-4，支持配置 endpoint +
+  /// SSRF 闸；未配置时明确失败，不编结果）。
+}
+
+/// **本地通知能力**（V0.4 T1-4，2026-11-02）—— `notify_user` 工具的宿主实现。
+///
+/// 走 `heracles/command` 的 `notifyUser`（Kotlin 侧 `postUserNotification`）。
+/// **权限被拒/通知被关 ⇒ 如实失败**（不假装发送成功）—— 用户在等通知，
+/// 假成功比没通知更糟。
+class DeviceNotificationCapability implements NotificationCapability {
+  const DeviceNotificationCapability({required this.channel});
+
+  final MethodChannel channel;
+
+  @override
+  Future<CapabilityResult> notify(String title, String body, {String? id}) async {
+    try {
+      final m = await channel.invokeMapMethod<String, dynamic>('notifyUser', {
+        'title': title,
+        'body': body,
+        if (id != null && id.isNotEmpty) 'id': id,
+      });
+      if (m == null) return const CapabilityFailure('通知通道无响应（未发送）');
+      if (m['ok'] == true) {
+        return CapabilitySuccess((m['message'] as String?) ?? '已发送通知');
+      }
+      return CapabilityFailure(
+        (m['error'] as String?) ?? '发送通知失败（原因未知）',
+        isRetryable: false,
+      );
+    } on MissingPluginException {
+      return const CapabilityFailure('当前环境不支持本地通知（通道缺失）');
+    } on PlatformException catch (e) {
+      return CapabilityFailure('发送通知失败：${e.message ?? e.code}');
+    }
+  }
 }
 
 /// 一次抓取的结果（内部用，**不抛**）。
@@ -2719,6 +2864,22 @@ Capabilities buildDeviceCapabilities({
   String? memorySessionId,
   /// 三作用域记忆服务（测试可注入假实现；默认按通道构造）。
   ScopedMemoryService? memoryService,
+  /// **搜索服务 endpoint**（V0.4 F4，2026-11-02；空 = 未配置）。
+  ///
+  /// ## 为什么由调用方注入，而不是这里直接读 `SearchConfigService`
+  ///
+  /// 1. 本函数是**同步装配函数**（一堆 `const` 构造 + 一行 `Capabilities`），
+  ///    secure storage 是异步 IO。为了读一个字符串把它改成 `Future`，
+  ///    会让所有测试/CLI 调用点跟着变形，收益却是零 —— 装配层不该做 IO。
+  /// 2. 装配函数是**纯的**：同样的入参永远给出同样的能力组合。一旦在这里
+  ///    读全局存储，单元测试就会依赖真机 KeyStore 的残留状态。
+  /// 3. 读失败要**能被上层看见**（"存储坏了" ≠ "没配置"），而这里没有
+  ///    把错误往上抛的位置：返回值是 `Capabilities`，不是结果类型。
+  ///    交给调用方（`local_agent` / 设置页）去 `read()`，它知道该显示什么。
+  ///
+  /// 不传 ⇒ 空字符串 ⇒ [DeviceWebCapability.search] 仍然**明确失败**
+  /// 「未配置搜索服务」，与改动前字节等价（不编造结果）。
+  String searchEndpoint = '',
 }) {
   final ch = channel ?? const DeviceChannelClient();
   return Capabilities(
@@ -2727,7 +2888,11 @@ Capabilities buildDeviceCapabilities({
     deviceHealth:
         includeHealth ? ChannelHealthCapability(channel: ch) : null,
     apk: includeApk ? const DeviceApkCapability() : null,
-    web: includeWeb ? const DeviceWebCapability() : null,
+    // ★ F4（2026-11-02）：endpoint 由调用方注入（见 [searchEndpoint] 的 KDoc）。
+    //   不传时是空串 ⇒ `search()` 仍明确失败，行为与旧代码一致。
+    web: includeWeb
+        ? DeviceWebCapability(searchEndpoint: searchEndpoint)
+        : null,
     memory: includeMemory
         ? ScopedMemoryCapability(
             workspacePath: workspaceRoot,
@@ -2767,6 +2932,12 @@ Capabilities buildDeviceCapabilities({
             workspacePath: workspaceRoot,
           )
         : null,
+    // ★ V0.4 T1-4（2026-11-02）：本地通知能力 —— `notify_user` 工具的宿主实现。
+    //   走 `heracles/command` 的 `notifyUser`；权限被拒/通道缺失 ⇒ 工具如实失败
+    //   （装配层**不能漏传**，否则工具永远不可用 —— 与 git 那次漏传同类）。
+    notification: DeviceNotificationCapability(
+      channel: const MethodChannel('heracles/command'),
+    ),
   );
 }
 

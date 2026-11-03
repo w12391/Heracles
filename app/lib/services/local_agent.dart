@@ -51,6 +51,7 @@ library;
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 
 import 'package:dio/dio.dart' show CancelToken;
 import 'package:heracles_backend/heracles_backend.dart';
@@ -65,6 +66,9 @@ import 'global_memory.dart' show runMemoryMigrationOnce;
 import 'image_input.dart';
 import 'memory_service.dart';
 import 'session_store.dart';
+import 'search_config_service.dart';
+import 'skill_gating.dart';
+import 'skills_service.dart';
 
 /// **执行面 → 历史命令卡口径**（D6，2026-10-29）。**纯函数**，便于单测。
 ///
@@ -180,6 +184,99 @@ Map<String, dynamic> buildToolRow({
     if (rawCommand != null && rawCommand.trim().isNotEmpty) 'command': rawCommand,
     'ts': ts,
   };
+}
+
+/// **一次 run 的续跑判定结果**（V0.4，纯数据 —— 便于单测）。
+///
+/// 为什么把判定抽成纯函数：策略矩阵（off/ask/auto × 轮数/token/取消）如果
+/// 埋在 `_drive` 的收尾大块里，只能靠端到端假 LLM 覆盖，回归成本高且容易
+/// "绿但没测到"。抽出来后矩阵可逐条断言。
+class RunStopDecision {
+  const RunStopDecision({
+    required this.reason,
+    required this.canContinue,
+    this.summary,
+  });
+
+  /// wire 名（`RunStopReason.wireName` 的字符串形式；UI 直接读）。
+  final String reason;
+
+  /// 是否可以继续。
+  final bool canContinue;
+
+  /// 人话摘要（给 UI 显示"为什么停了"；不得是堆栈）。
+  final String? summary;
+}
+
+/// **续跑判定**（V0.4，纯函数）。
+///
+/// 优先级：**用户取消 > token 预算 > 轮次/询问策略**。`failed` 不进本函数
+/// （失败走 `failed` 事件，不伪装成"可续"）。
+///
+/// 口径：
+/// - `policy == off` 且非取消 ⇒ 不发（返回 null）—— 旧行为完全不变；
+/// - `policy == ask` ⇒ 每轮结束都"待确认"（`canContinue=true`）；
+/// - `policy == auto` ⇒ 到 [maxRounds] 轮仍未完成 ⇒ 待确认；
+/// - `tokensSpent >= tokenLimit` ⇒ `token_budget`（谁先到停谁）。
+///
+/// [taskDone] = 本次 run 是否正常完成（`finished` 且计划全 done/cancelled）。
+/// 已完成的任务**不需要续跑**（返回 null，UI 显示"完成"而不是"中断"）。
+RunStopDecision? decideRunStop({
+  required ContinuePolicy policy,
+  required bool cancelled,
+  required bool failed,
+  required bool taskDone,
+  required int round,
+  required int maxRounds,
+  required int tokensSpent,
+  required int tokenLimit,
+  required int noProgressStreak,
+  required int noProgressRounds,
+}) {
+  // 取消：即使 off 也要告诉 UI"是被用户停的"（不是失败）。
+  if (cancelled) {
+    return const RunStopDecision(
+      reason: 'user_cancel',
+      canContinue: false,
+      summary: '任务被用户取消',
+    );
+  }
+  // 失败：不伪装可续（由 failed 事件承担）。
+  if (failed) return null;
+  // 已完成：不需要续跑。
+  if (taskDone) return null;
+  // token 预算：**硬预算优先**（"谁先到停谁"里 token 是不可协商的那条线）。
+  if (tokensSpent >= tokenLimit) {
+    return RunStopDecision(
+      reason: 'token_budget',
+      canContinue: policy != ContinuePolicy.off,
+      summary: '已用 $tokensSpent / $tokenLimit token（到上限即停）',
+    );
+  }
+  // 无进展：连续 N 轮文件/错误都没变 ⇒ 停下并如实说明。
+  if (noProgressStreak >= noProgressRounds) {
+    return RunStopDecision(
+      reason: 'no_progress',
+      canContinue: policy != ContinuePolicy.off,
+      summary: '连续 $noProgressStreak 轮没有进展（文件与错误都没变化）',
+    );
+  }
+  // 轮次策略：off 不续（旧行为）；ask 每轮问；auto 到上限问。
+  if (policy == ContinuePolicy.off) return null;
+  if (policy == ContinuePolicy.ask) {
+    return const RunStopDecision(
+      reason: 'max_rounds',
+      canContinue: true,
+      summary: '本轮结束（继续模式=每轮询问），等待确认后再跑一轮',
+    );
+  }
+  // auto：没到上限就继续（不发事件，由宿主自动续跑）；到上限才停。
+  if (round < maxRounds) return null;
+  return RunStopDecision(
+    reason: 'max_rounds',
+    canContinue: true,
+    summary: '已到自动续跑上限 $maxRounds 轮，等待确认后再跑一轮',
+  );
 }
 
 /// 一次 run 的句柄。
@@ -703,11 +800,23 @@ class LocalAgentExecutor {
     this.askGate,
     this.clientForTest,
     this.capabilitiesForTest,
+    this.processKilledProbe,
+    this.processKilledConsume,
   });
 
   final String workspacePath;
   final AppSettings settings;
   final SessionStore sessionStore;
+
+  /// **上次 run 是否被系统停止**（V0.4 T0-2；宿主注入，`null` = 不检查）。
+  ///
+  /// 由 `agent_bridge` 注入（避免 local_agent 反向依赖 bridge 造成循环 import）：
+  /// `() => AgentBridge.processKilled()`。读不到 ⇒ 无行为。
+  /// **非 final**：工厂类型（executorFactoryForTest）只有 4 个参数，宿主在构造后注入。
+  Future<({bool killed, int killedAt})> Function()? processKilledProbe;
+
+  /// 提示消费后清标记（`null` = 不清）。
+  Future<void> Function()? processKilledConsume;
 
   /// 提问/审批门禁（UI 注入）。`null` = 当前环境不能问用户。
   final AskGate? askGate;
@@ -862,12 +971,29 @@ class LocalAgentExecutor {
     //
     // ★ 记忆能力带**寻址**（2026-10-29）：workspace + 已解析的 sid。
     //   没有这个上下文，save_memory 就不知道写哪个作用域（旧实现写全局）。
+    // ★ 搜索服务 endpoint（V0.4 F4，2026-11-02）：从安全存储读出来注入能力。
+    //
+    // 为什么在这里读而不是在 `buildDeviceCapabilities` 里读：那是**装配函数**
+    // （纯同步、无 IO），在里面 await secure storage 会让它在测试里无法构造。
+    //
+    // 读不到（首次 / 存储异常）⇒ 传空串 ⇒ `web_search` 保持"未配置搜索服务"
+    // 的**明确失败**（不是编个结果，也不是静默成功）。
+    var searchEndpoint = '';
+    if (capabilitiesForTest == null) {
+      try {
+        searchEndpoint = (await SearchConfigService().read()).endpoint;
+      } catch (_) {
+        // 存储损坏/被清 ⇒ 当没配置（run 不该因为搜索配置读不出来而失败）
+        searchEndpoint = '';
+      }
+    }
     final caps = capabilitiesForTest ??
         buildDeviceCapabilities(
           workspaceRoot: workspacePath,
           includeSandbox: true,
           memorySessionId: sid,
           memoryService: memoryService,
+          searchEndpoint: searchEndpoint,
         );
 
     // ---- 模型配置 ----
@@ -1110,55 +1236,81 @@ class LocalAgentExecutor {
       }
     }
 
-    final agent = HeraclesAgent(
-      config: config,
-      capabilities: caps,
-      options: RunOptions(
-        maxTurns: maxTurns,
-        maxToolCalls: ContractAgent.maxToolCalls,
-        // ★ 三作用域记忆（2026-10-29）：结构化传入，排序/预算/渲染在 backend。
-        //   非空即优先（即使三段都空也不回落旧 memoryNote —— 旧字段已 @Deprecated）。
-        memory: memoryContext,
-        // ★ 插队发送（P0，2026-10-30）：轮结束取一条插话 ⇒ backend `_SteerHook`
-        //   注入成 UserMessage；不打断在途流/工具。队列在本实例（每 run 一个）。
-        takeSteerMessage: takeSteer,
-        // ★ 工作区宪法（H4，2026-10-24）：注入 system prompt
-        //  （默认提示之后、长期记忆之前 —— 两段稳定字节之间的新段，
-        //   只有宪法内容本身变化时才动前缀）。
-        systemPrompts: [
-          ?constitutionNote,
-          ?snapshotNote,
-          ?ragNote,
-        ],
-        // ★ 审批档位（2026-10-24 接线）：从设置显式映射。
-        //   backend 库默认 fullAccess（不拦，库没有 UI 可问）；
-        //   App 是有 UI 的宿主，**必须**把用户选的档位传下去 ——
-        //   拦截在 backend 的 `_ApprovalHook`，"问谁"在 [LocalAskGate]。
-        // ★ 子代理（H6，2026-10-24）：App 显式开启 —— 探索/核对类子任务
-        //   在干净上下文里跑，主上下文只收结论。
-        enableSubAgents: true,
-        // ★ 内置技能（S1/S2，2026-10-24）：目录常驻（每条一行），
-        //   模型按任务用 activate_skills 按需加载全文。
-        enableSkills: true,
-        approvalMode: switch (settings.permission) {
-          PermissionMode.manual => ApprovalMode.manual,
-          PermissionMode.workspaceAuto => ApprovalMode.workspaceAuto,
-          PermissionMode.fullAccess => ApprovalMode.fullAccess,
-        },
-      ),
-      askGate: gate,
-      client: clientForTest, // 测试缝（生产 null ⇒ 用 config 建真实 client）
-    );
+    // ---- ★ V0.4 T1-5（2026-11-02）：扫描用户技能（工作区 SKILL.md）----
+    //
+    // 扫描失败/没有技能 ⇒ 空列表（只有内置三技能，行为与旧版一致）。
+    // 放在 buildAgent 之前：技能是构造期参数（与 systemPrompts 同理）。
+    final userSkills = await _scanUserSkills(caps);
+
+    // ---- ★ V0.4 自动续跑：agent 按轮构造（续跑轮追加"继续"内部说明）----
+    //
+    // 首轮 systemPrompts 与旧版**逐字节一致**（续跑说明为 null 不注入），
+    // 因此前缀缓存不受影响；续跑轮才多一段。
+    HeraclesAgent buildAgent({bool continuation = false, int round = 1}) =>
+        HeraclesAgent(
+          config: config,
+          capabilities: caps,
+          options: RunOptions(
+            maxTurns: maxTurns,
+            maxToolCalls: ContractAgent.maxToolCalls,
+            // ★ 三作用域记忆（2026-10-29）：结构化传入，排序/预算/渲染在 backend。
+            //   非空即优先（即使三段都空也不回落旧 memoryNote —— 旧字段已 @Deprecated）。
+            memory: memoryContext,
+            // ★ 插队发送（P0，2026-10-30）：轮结束取一条插话 ⇒ backend `_SteerHook`
+            //   注入成 UserMessage；不打断在途流/工具。队列在本实例（每 run 一个）。
+            takeSteerMessage: takeSteer,
+            // ★ 工作区宪法（H4，2026-10-24）：注入 system prompt
+            //  （默认提示之后、长期记忆之前 —— 两段稳定字节之间的新段，
+            //   只有宪法内容本身变化时才动前缀）。
+            systemPrompts: [
+              ?constitutionNote,
+              ?snapshotNote,
+              ?ragNote,
+              // ★ 续跑说明（只增段；首轮 null ⇒ 前缀不变）
+              if (continuation) continuationNoteStatic(round),
+            ],
+            // ★ 审批档位（2026-10-24 接线）：从设置显式映射。
+            //   backend 库默认 fullAccess（不拦，库没有 UI 可问）；
+            //   App 是有 UI 的宿主，**必须**把用户选的档位传下去 ——
+            //   拦截在 backend 的 `_ApprovalHook`，"问谁"在 [LocalAskGate]。
+            // ★ 子代理（H6，2026-10-24）：App 显式开启 —— 探索/核对类子任务
+            //   在干净上下文里跑，主上下文只收结论。
+            enableSubAgents: true,
+            // ★ 内置技能（S1/S2，2026-10-24）：目录常驻（每条一行），
+            //   模型按任务用 activate_skills 按需加载全文。
+            enableSkills: true,
+            // ★ V0.4 T1-5（2026-11-02）：用户技能（扫描工作区 SKILL.md 得到；
+            //   空 = 只有内置三技能，行为与旧版一致）。
+            userSkills: userSkills,
+            approvalMode: switch (settings.permission) {
+              PermissionMode.manual => ApprovalMode.manual,
+              PermissionMode.workspaceAuto => ApprovalMode.workspaceAuto,
+              PermissionMode.fullAccess => ApprovalMode.fullAccess,
+            },
+          ),
+          askGate: gate,
+          client: clientForTest, // 测试缝（生产 null ⇒ 用 config 建真实 client）
+        );
 
     final tr = _Translator(controller.add);
 
+    // ---- ★ V0.4 T0-2（2026-11-02）：上次 run 被系统停止 ⇒ 如实提示 ----
+    //
+    // 前台服务被系统杀掉时写了 `process_killed` 标记；这里在**新 run 开始时**
+    // 读一次并：
+    //   ① 发 `run_stopped(process_killed)`（canContinue=true）让 UI 显示
+    //      "上次任务被系统停止，可从进度继续"——**不假装它还在跑**；
+    //   ② 清标记（避免每次打开都提示）。
+    // 读不到（旧 APK/通道缺失）⇒ 完全无行为（不影响主链路）。
+    unawaited(_reportProcessKilledIfAny(tr));
+
     // ---- 真正驱动（不 await，让 events 先被订阅）----
-    final done = _drive(
-      agent,
-      tr,
-      request,
-      sid, // 2026-10-29：sid 已在构造前解析（记忆寻址的前置条件）
-      controller,
+    final done = _driveWithAutoContinue(
+      buildAgent: buildAgent,
+      tr: tr,
+      request: request,
+      sid: sid, // 2026-10-29：sid 已在构造前解析（记忆寻址的前置条件）
+      controller: controller,
       images: images,
       imageNotes: imageNotes,
       attachments: attachments,
@@ -1336,6 +1488,66 @@ class LocalAgentExecutor {
   }
 
   /// 执行体：把 `HeraclesAgent.run()` 的事件逐条翻译并落盘。
+  /// **带自动续跑的驱动**（V0.4）：`auto` 模式在未完成任务时自动再跑一轮。
+  ///
+  /// ## 循环条件（只有 `auto` 会循环）
+  ///
+  /// 每轮 `_drive` 返回 `AgentRunResult`；这里只看**还要不要下一轮**：
+  /// 取消/失败/完成/非 auto/到上限 ⇒ 停。
+  ///
+  /// `ask` 不循环（每轮发 `run_stopped` 等用户点"继续"，由 UI 再发一次 run）。
+  /// 续跑轮：`continuation=true`（**不写 user 行**）+ 内部说明注入 system 提示。
+  Future<AgentRunResult> _driveWithAutoContinue({
+    required HeraclesAgent Function({bool continuation, int round}) buildAgent,
+    required _Translator tr,
+    required String request,
+    required String sid,
+    required StreamController<AgentEvent> controller,
+    List<ImageInput>? images,
+    List<String> imageNotes = const [],
+    List<HAttachment> attachments = const [],
+    CancelToken? cancelToken,
+  }) async {
+    final mode = await _readContinueMode();
+    final maxRounds = mode == 'auto' ? ContractRunContinue.autoMaxRounds : 1;
+    AgentRunResult? last;
+    for (var round = 1; round <= maxRounds; round++) {
+      final agent = buildAgent(continuation: round > 1, round: round);
+      last = await _drive(
+        agent,
+        tr,
+        request,
+        sid,
+        controller,
+        images: images,
+        imageNotes: imageNotes,
+        attachments: attachments,
+        cancelToken: cancelToken,
+        continuation: round > 1,
+        continuationRound: round,
+      );
+      if (_cancelled || last.cancelled) break;
+      if (last.stopReason == '运行失败') break;
+      if (mode != 'auto') break;
+      if (round >= maxRounds) break;
+      if (last.stopReason == '已给出最终回答') break;
+    }
+    return last ??
+        const AgentRunResult(
+          stopReason: '未执行',
+          finalText: '',
+          turns: <AgentTurn>[],
+          totalCachedTokens: 0,
+          totalPromptTokens: 0,
+          totalOutputTokens: 0,
+          steadyHitRate: null,
+          changeFiles: null,
+          taskWallMs: 0,
+          sessionId: null,
+          cancelled: false,
+        );
+  }
+
   Future<AgentRunResult> _drive(
     HeraclesAgent agent,
     _Translator tr,
@@ -1346,6 +1558,14 @@ class LocalAgentExecutor {
     List<String> imageNotes = const [],
     List<HAttachment> attachments = const [],
     CancelToken? cancelToken,
+    /// **V0.4 自动续跑的第 N 轮**（`true` ⇒ 不落盘用户消息）。
+    ///
+    /// 续跑是宿主自动发起的，不是用户说的；写一条 user 行等于**伪造历史**
+    /// （回放时用户会看到自己没说过的话）。改为把"继续上次未完成的任务"
+    /// 作为内部说明注入 system 提示。
+    bool continuation = false,
+    /// 续跑轮次（1 = 首轮；>1 = 自动续跑第 N 轮）。
+    int continuationRound = 1,
   }) async {
     final sw = Stopwatch()..start();
 
@@ -1408,22 +1628,25 @@ class LocalAgentExecutor {
     }
 
     // 用户消息先落盘（与旧 Kotlin 的顺序一致：用户消息先于一切）
+    // ★ V0.4：**续跑不落用户消息**（continuation=true 跳过）—— 续跑不是用户说的。
     // ★ 附件结构化落盘（2026-10-29）：path/name/kind —— 读回时
     //   气泡能把图片渲染成图。只增字段，老版本读到会原样保留
     //   （_normalizeEntry 未知键透传），不破坏兼容。
-    await sessionStore.appendMessage(sid, {
-      'role': 'user',
-      'text': request,
-      if (attachments.isNotEmpty)
-        'attachments': attachments
-            .map((a) => <String, dynamic>{
-                  'path': a.path,
-                  'name': a.name,
-                  'kind': a.kind.name,
-                })
-            .toList(),
-      'ts': DateTime.now().millisecondsSinceEpoch,
-    });
+    if (!continuation) {
+      await sessionStore.appendMessage(sid, {
+        'role': 'user',
+        'text': request,
+        if (attachments.isNotEmpty)
+          'attachments': attachments
+              .map((a) => <String, dynamic>{
+                    'path': a.path,
+                    'name': a.name,
+                    'kind': a.kind.name,
+                  })
+              .toList(),
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      });
+    }
 
     tr.sessionId = sid;
 
@@ -1457,6 +1680,11 @@ class LocalAgentExecutor {
     var failed = false;
     var cancelled = false;
     var finalText = '';
+
+    /// 本轮**总轮数**（`HeraclesFinished.turns`）—— 会话用量汇总用。
+    ///
+    /// `null` = run 没有正常收尾（取消/异常），此时退化为 `tr.currentTurn`。
+    int? finishedTurns;
 
     // ---- 计划终态（B8 P0，2026-10-30）----
     //
@@ -1500,6 +1728,15 @@ class LocalAgentExecutor {
       'write_file', 'edit', 'apply_patch', 'mkdir',
       'delete_path', 'move_path', 'copy_path',
     };
+
+    // ---- ★ V0.4 进展快照（2026-11-02）----
+    //
+    // 每个工具完成时采样（改动文件签名 + 最近失败输出的错误签名 + 输出里的测试数），
+    // 与上一帧比：没变化就累加 streak；连续 2 轮 ⇒ 收尾判 `no_progress`。
+    // **拿不到的信号留 null，绝不编数**（见 backend `progress_snapshot.dart`）。
+    ProgressSnapshot? lastProgress;
+    int noProgressStreak = 0;
+    String? lastErrorOutput;
 
     try {
       // ★ 跨轮记忆在这里生效：`history` 成为 state 的开头，
@@ -1646,6 +1883,19 @@ class LocalAgentExecutor {
                 ts: DateTime.now().millisecondsSinceEpoch,
               ),
             );
+            // ★ V0.4 进展快照采样（每个工具完成时）：
+            //   改动文件签名 + 失败错误签名 + 输出里的测试数；与上一帧比 ⇒ 累加 streak。
+            if (isError) lastErrorOutput = output;
+            final counts = parseTestCounts(output);
+            final snap = ProgressSnapshot(
+              filesSignature: filesSignatureOf(changes.keys.toList()),
+              changedFiles: changes.keys.toList(),
+              testsPassed: counts?.passed,
+              testsTotal: counts?.total,
+              errorSignature: errorSignatureOf(lastErrorOutput),
+            );
+            noProgressStreak = snap.progressedFrom(lastProgress) ? 0 : noProgressStreak + 1;
+            lastProgress = snap;
           case HeraclesFallback(:final from, :final to, :final reason):
             tr.fallbackNotice(from, to, reason);
           case HeraclesBudgetWarning(:final used, :final limit):
@@ -1677,6 +1927,32 @@ class LocalAgentExecutor {
             planClosedReachedGoal = reachedGoal;
             planClosedReason = reason;
             tr.planClosed(reachedGoal: reachedGoal, reason: reason);
+          case HeraclesRunStopped(
+              :final reason,
+              :final round,
+              :final maxRounds,
+              :final tokensSpent,
+              :final tokensLimit,
+              :final nextEstimate,
+              :final canContinue,
+              :final changedFiles,
+              :final errorSummary,
+              :final resumedFromRound,
+            ):
+            // ★ V0.4（N14）：任务被策略停下 —— **强类型字段直填**给 UI
+            //   （前端 `RunStopInfo` 适配层仍兼容 raw，但强类型落地后可直接读）。
+            tr.runStopped(
+              reason.wireName,
+              round: round,
+              maxRounds: maxRounds,
+              tokensSpent: tokensSpent,
+              tokensLimit: tokensLimit,
+              nextEstimate: nextEstimate,
+              canContinue: canContinue,
+              changedFiles: changedFiles,
+              errorSummary: errorSummary,
+              resumedFromRound: resumedFromRound,
+            );
           case HeraclesContextCompressed(
               :final beforeMessages,
               :final afterMessages,
@@ -1694,6 +1970,7 @@ class LocalAgentExecutor {
             );
           case HeraclesFinished(finalText: final ft, turns: final turnCount):
             finalText = ft;
+            finishedTurns = turnCount;
             tr.endStep(status: ft.trim().isEmpty ? 'empty' : 'ok');
             tr.settleTurn(); // 最终回答轮（无工具）也要记账
             tr.finished(ft, turnCount, sw.elapsedMilliseconds);
@@ -1793,6 +2070,111 @@ class LocalAgentExecutor {
       );
     }
 
+    // ---- 会话用量汇总行（T1-5，2026-10-31）----
+    //
+    // **只在有 turn 的 run 写**（空 run 不留空壳）；位置钉死在 assistant 行
+    // **之前** —— 保持"会话文件最后一行是 assistant 回答"这个既有不变量
+    // （`jsonl_accounting_test` 钉过它），汇总行放在回答前一步。
+    // 口径 = **本会话累计**（读上一条汇总再累加，跨 run/重启不丢；旧文件
+    // 没有该行 ⇒ 从 0 起，不假装有）。单写者：`_drive` 收尾串行调用。
+    await _appendSessionUsage(
+      sid: sid,
+      tr: tr,
+      runTurns: finishedTurns ?? tr.currentTurn,
+    );
+
+    // ---- 组装 AgentRunResult（UI 的权威结果）----
+    //
+    // 2026-10-22：`turns` 与三个 token 总数、稳态命中率**全部换成真实记账**
+    // （此前 turns 恒空、token 恒 0 —— 顶栏与侧栏"不可用"的根因）。
+    lastFrozenTokens = tr.firstTurnPrompt;
+    // ★ C5（2026-10-24）：上下文构成 —— 侧栏"构成"三行的数据源（估算）。
+    try {
+      lastBreakdown = agent.contextBreakdown();
+    } catch (_) {
+      lastBreakdown = const <String, int>{};
+    }
+    // ---- ★ V0.4 长任务续跑：checkpoint + run_stopped（2026-11-02）----
+    //
+    // ## 为什么放在这里（assistant 行之前、所有收尾之后）
+    // checkpoint 行是"这一轮跑到哪了"的快照；run_stopped 是"任务被策略停下"的
+    // 信号。两者都必须**先于** assistant 行落盘（重放顺序：checkpoint → 回答）。
+    //
+    // ## 口径（如实）
+    // · round = 本次 run 实际跑了几轮（`finishedTurns` 或 `tr.currentTurn`）；
+    // · tokensSpent = prompt + output 累计（**与顶栏同一口径**）；
+    // · 策略 = 前端 prefs `heracles.run.continueMode`（off/ask/auto），读不到 = off；
+    // · 只在策略非 off（或用户取消）时发 `run_stopped`；`failed` 仍走 failed 事件，
+    //   不混成"可续"（错误不是预算问题）。
+    // round 口径：本次 run 内部轮次；**续跑轮按"累计轮"记**（continuationRound）
+    // —— 恢复时看到的是"这个任务总共跑到第几轮"，而不是"这一轮内部跑了几圈"。
+    final round = continuationRound > 1
+        ? continuationRound + (finishedTurns ?? tr.currentTurn) - 1
+        : (finishedTurns ?? tr.currentTurn);
+    final tokensSpent = tr.totalPrompt + tr.totalOutput;
+    final continueMode = await _readContinueMode();
+    final policy = switch (continueMode) {
+      'auto' => ContinuePolicy.auto,
+      'ask' => ContinuePolicy.ask,
+      _ => ContinuePolicy.off,
+    };
+    final tokenLimit = ContractRunContinue.runTokenLimit;
+    final maxRounds = ContractRunContinue.autoMaxRounds;
+
+    // checkpoint：每轮结束都写（append-only；宿主据此恢复，不重复消息）。
+    if (round > 0 && !failed) {
+      await sessionStore.appendMessage(sid, {
+        ContractRunContinue.checkpointRole: true,
+        'role': ContractRunContinue.checkpointRole,
+        'sessionId': sid,
+        'runId': '$sid-$round-${sw.elapsedMilliseconds}',
+        'round': round,
+        'plan': lastPlanSteps,
+        'toolCalls': tr.turnRecords.where((t) => t.tool != null).length,
+        'tokens': tokensSpent,
+        'lastMessage': finalText.length > 200
+            ? finalText.substring(finalText.length - 200)
+            : finalText,
+        'progressSnapshot': lastProgress?.toJson() ??
+            {
+              'changedFiles': changeFiles.map((c) => c['path']).toList(),
+            },
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      });
+    }
+
+    // run_stopped 判定：抽成纯函数（矩阵可单测，见 decideRunStop）。
+    //
+    // taskDone：正常收尾（`finishedTurns != null`）且计划全 done/cancelled。
+    final taskDone = finishedTurns != null &&
+        lastPlanSteps.every((s) =>
+            s['status'] == 'done' || s['status'] == 'cancelled');
+    final decision = decideRunStop(
+      policy: policy,
+      cancelled: cancelled,
+      failed: failed,
+      taskDone: taskDone,
+      round: round,
+      maxRounds: maxRounds,
+      tokensSpent: tokensSpent,
+      tokenLimit: tokenLimit,
+      // 真实 streak：由工具完成时的 ProgressSnapshot 比较累加（见采样处）。
+      noProgressStreak: noProgressStreak,
+      noProgressRounds: ContractRunContinue.noProgressRounds,
+    );
+    if (decision != null) {
+      tr.runStopped(
+        decision.reason,
+        round: round,
+        maxRounds: maxRounds,
+        tokensSpent: tokensSpent,
+        tokensLimit: tokenLimit,
+        canContinue: decision.canContinue,
+        changedFiles: [for (final c in changeFiles) '${c['path']}'],
+        errorSummary: decision.summary,
+      );
+    }
+
     // ---- 最终结果落盘（助手回答）----
     //
     // ★ 2026-10-22：`prompt/out/cached` 从**恒 0** 改为真实上报值
@@ -1818,17 +2200,7 @@ class LocalAgentExecutor {
       });
     }
 
-    // ---- 组装 AgentRunResult（UI 的权威结果）----
-    //
-    // 2026-10-22：`turns` 与三个 token 总数、稳态命中率**全部换成真实记账**
-    // （此前 turns 恒空、token 恒 0 —— 顶栏与侧栏"不可用"的根因）。
-    lastFrozenTokens = tr.firstTurnPrompt;
-    // ★ C5（2026-10-24）：上下文构成 —— 侧栏"构成"三行的数据源（估算）。
-    try {
-      lastBreakdown = agent.contextBreakdown();
-    } catch (_) {
-      lastBreakdown = const <String, int>{};
-    }
+
     return AgentRunResult(
       stopReason: cancelled
           ? '已取消'
@@ -1846,6 +2218,143 @@ class LocalAgentExecutor {
       sessionId: sid,
       cancelled: cancelled,
     );
+  }
+
+  /// **读会话最后一条 checkpoint**（V0.4 进程被杀恢复）。
+  ///
+  /// 只读最后一条 `role:"run_checkpoint"` 行（倒扫），拿 `round`/`tokens`/`plan`。
+  /// 读不到/旧文件没有 ⇒ 空 Map（行为与没有恢复功能时完全一致）。
+  Future<Map<String, Object?>> _lastCheckpointOf(String sid) async {
+    try {
+      final rows = await sessionStore.loadMessages(sid, limit: 0);
+      for (final row in rows.reversed) {
+        if (row['role'] == ContractRunContinue.checkpointRole) return row;
+      }
+    } catch (_) {
+      // 读失败 ⇒ 不恢复（恢复是增强，不该拖垮主链路）
+    }
+    return const <String, Object?>{};
+  }
+
+  /// **测试缝**：暴露"读最后一条 checkpoint"（V0.4 恢复逻辑）。
+  Future<Map<String, Object?>> lastCheckpointForTest(String sid) =>
+      _lastCheckpointOf(sid);
+
+  /// **测试缝**：续跑内部说明（验证它进 system 提示而不是 user 文本）。
+  static String continuationNoteForTest(int round) =>
+      continuationNoteStatic(round);
+
+  /// 续跑内部说明的**唯一定义**（实例方法也调它）。
+  static String continuationNoteStatic(int round) =>
+      '【自动续跑第 $round 轮】上一轮的输出还没完成任务。请接着上一轮的历史继续，'
+      '不要重复已完成的工作；先确认当前进展（看计划/文件/测试），再继续下一步。'
+      '如果你判断任务已经完成，请直接给出最终回答。';
+
+  /// 续跑模式（V0.4，2026-11-02 用户裁定）：**固定自动 3 轮，不开放设置**。
+  ///
+  /// 之前读 `SharedPreferences['heracles.run.continueMode']`（off/ask/auto），
+  /// 用户明确「默认自动 3 轮，不能调」⇒ 不再读 prefs，始终 auto。
+  Future<String> _readContinueMode() async => 'auto';
+
+  /// **扫描用户技能**（V0.4 T1-5，2026-11-02）。
+  ///
+  /// 在工作区里找 `**/SKILL.md`（约定目录 `.heracles/skills/`），逐个解析成
+  /// `SkillEntry` 交给 backend 注入（`RunOptions.userSkills`）。
+  ///
+  /// ## 不假装
+  ///
+  /// - 没有 `SKILL.md` ⇒ 空列表（只有内置三技能，行为与旧版一致）；
+  /// - 解析失败 ⇒ **跳过该文件**（不整体失败、也不假装它生效）；
+  /// - 扫描本身失败（能力缺失/通道异常）⇒ 空列表 + 不阻断 run。
+  ///
+  /// 为什么不在这里做"安装"：安装 = 下载/解压技能包，属宿主另一条链路；
+  /// 本方法只负责"已经躺在工作区里的技能"被真正加载。
+  Future<List<SkillEntry>> _scanUserSkills(Capabilities caps) async {
+    final ws = caps.workspace;
+    if (ws == null) return const <SkillEntry>[];
+    try {
+      final found = await ws.findFiles('.heracles/skills/**/SKILL.md', maxResults: 50);
+      if (found is! CapabilitySuccess) return const <SkillEntry>[];
+      final paths = found.data
+          .split('\n')
+          .map((l) => l.trim())
+          .where((l) => l.toLowerCase().endsWith('skill.md'))
+          .toList(growable: false);
+      if (paths.isEmpty) return const <SkillEntry>[];
+      final registry = SkillRegistry();
+      for (final p in paths) {
+        try {
+          final read = await ws.read(p);
+          if (read is! CapabilitySuccess) continue;
+          final r = parseSkillMd(read.data, source: 'user');
+          if (r.ok) registry.scan({p: read.data}, source: 'user');
+          // 解析失败 ⇒ 跳过（不假装生效）
+        } catch (_) {
+          // 单个文件失败不影响其它
+        }
+      }
+
+      // ★ V0.4 F1（2026-11-02）：启停开关**必须在这里生效**。
+      //
+      // 在此之前，用户在 Skills 页关掉的技能照样被注入 —— 开关看着生效、
+      // 实际无效。闸门的判断见 `skill_gating.dart`（纯函数，带边界测试）：
+      // 读不到启停表（旧宿主/通道缺失/读失败）⇒ 传 null ⇒ **不筛**，
+      // 保持旧行为；读到才按名字过滤。
+      return filterEnabledSkills(
+        registry.enabled,
+        await _enabledSkillNamesOrNull(),
+      );
+    } catch (_) {
+      return const <SkillEntry>[];
+    }
+  }
+
+  /// 读"已启用技能名"集合；**任何异常/通道缺失都返回 null**（= 不筛）。
+  ///
+  /// 为什么用 `SkillsService.listSkills()` 而不是自己调通道：解析、降级、
+  /// 错误码那一套逻辑已经在那边了，这里再写一份就会漂。代价是每次 run 多
+  /// 一次通道往返（毫秒级，且只在有 `SKILL.md` 时才发生）。
+  Future<Set<String>?> _enabledSkillNamesOrNull() async {
+    try {
+      final snap = await SkillsService(workspace: workspacePath).listSkills();
+      // 通道缺失 ⇒ 这份快照里根本没有用户技能（user 为空、builtin 恒 true），
+      // 拿它去筛会把所有用户技能误杀 ⇒ 明确当作"读不到"。
+      if (snap.code == SkillsService.errChannelMissing) return null;
+      return <String>{
+        for (final s in [...snap.builtin, ...snap.user])
+          if (s.enabled) s.name,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// **上次 run 被系统停止 ⇒ 如实提示**（V0.4 T0-2，2026-11-02）。
+  ///
+  /// 前台服务 `onTaskRemoved` 写 `process_killed` 标记；这里读一次、发
+  /// `run_stopped(process_killed)`（canContinue=true）并清标记。
+  ///
+  /// 为什么要发 run_stopped 而不是 failed：任务**不是出错**，是被系统杀掉；
+  /// 语义上是"可继续的停止"（配合 checkpoint 恢复）。**不假装它还在跑**。
+  Future<void> _reportProcessKilledIfAny(_Translator tr) async {
+    try {
+      final probe = processKilledProbe;
+      if (probe == null) return; // 宿主未注入 ⇒ 无行为
+      final r = await probe();
+      if (!r.killed) return;
+      tr.runStopped(
+        'process_killed',
+        round: 0,
+        maxRounds: ContractRunContinue.autoMaxRounds,
+        tokensSpent: 0,
+        tokensLimit: ContractRunContinue.runTokenLimit,
+        canContinue: true,
+        errorSummary: '上次任务被系统停止（不是出错），可从上次进度继续',
+      );
+      await processKilledConsume?.call();
+    } catch (_) {
+      // 通道缺失/旧 APK ⇒ 无行为（不影响主链路）
+    }
   }
 
   /// 上一次 run 的**冻结区** token（= 首轮 promptTokens，provider 真实上报）。
@@ -1872,6 +2381,130 @@ class LocalAgentExecutor {
     final s = e.toString();
     return s.length > 300 ? '${s.substring(0, 300)}…' : s;
   }
+
+  /// **追加会话用量汇总行**（T1-5，2026-10-31；只增行类型）。
+  ///
+  /// ## 口径：**本会话累计**
+  ///
+  /// 每次 run 收尾读会话文件里**最后一条** `role:"session_usage"` 行（上一次
+  /// 累计），把本场 run 的数加上去再写一行 —— 跨 run、跨重启都不丢；
+  /// 旧文件没有该行 ⇒ 从 0 起（不假装有历史、也不重写旧行）。
+  ///
+  /// ## 字段语义
+  ///
+  /// · `runs`：累计 run 场数（含失败的——失败 run 也消耗了模型调用）；
+  /// · `turns`：累计**总轮数**（`HeraclesFinished.turns`；取消/异常退化为
+  ///   本轮实际开始的轮数）；
+  /// · `reportedTurns`：累计**拿到 usage 的轮数**（与 assistant 行同源）；
+  /// · `unreportedTurns`：累计"有轮次但 provider 没上报 usage"的轮数
+  ///   （= turns - reportedTurns，用来解释"顶栏用量为什么偏小"）；
+  /// · `prompt` / `out` / `cached`：累计 token。`cached` 只在**至少上报过
+  ///   一次**缓存字段时才写 —— 从没上报过就**不写键**（不写假 0，
+  ///   前端显示"不可用"）。
+  /// · `steadyHitRate`：**最近一场能算出的**稳态命中率（跨 run 不重算 token
+  ///   加权——那会变成另一个口径）；没有 ⇒ 不写键（null）。
+  /// · `ts`：写入时间。
+  ///
+  /// ## 为什么只在 `runTurns > 0` 时写
+  ///
+  /// 空 run（还没开始就失败/被取消）没有用量可记 —— 写一行全 0 的汇总会
+  /// 让"会话用量"看起来比实际更差，且让 runs 虚高。
+  Future<void> _appendSessionUsage({
+    required String sid,
+    required _Translator tr,
+    required int runTurns,
+  }) async {
+    if (runTurns <= 0) return;
+
+    // 读上一次累计（读不到 ⇒ 从 0 起，不阻断收尾）。
+    var prev = _UsageAccum.zero;
+    try {
+      final rows = await sessionStore.loadMessages(sid, limit: 0);
+      for (var i = rows.length - 1; i >= 0; i--) {
+        if (rows[i]['role'] == 'session_usage') {
+          prev = _UsageAccum.fromRow(rows[i]);
+          break;
+        }
+      }
+    } catch (_) {
+      // 读失败（通道异常/超大文件）⇒ 按首次累计；宁可少累计也不阻断 run。
+    }
+
+    final reported = tr.turnRecords.length;
+    final unreported = runTurns > reported ? runTurns - reported : 0;
+    final cachedReported = prev.cachedReported || tr.anyCachedReported;
+    final rate = tr.steadyHitRate ?? prev.steadyHitRate;
+
+    await sessionStore.appendMessage(sid, <String, dynamic>{
+      'role': 'session_usage',
+      'runs': prev.runs + 1,
+      'turns': prev.turns + runTurns,
+      'reportedTurns': prev.reportedTurns + reported,
+      'unreportedTurns': prev.unreportedTurns + unreported,
+      'prompt': prev.prompt + tr.totalPrompt,
+      'out': prev.out + tr.totalOutput,
+      // 只增字段：从没上报过缓存 ⇒ 不写键（不写假 0）。
+      if (cachedReported) 'cached': prev.cached + tr.totalCached,
+      // null 不写键（前端显示"不可用"，不是 0%）
+      'steadyHitRate': ?rate,
+      'ts': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+}
+
+/// **会话用量累计**（读 `role:"session_usage"` 行用）—— 纯数据。
+///
+/// 只包含汇总行里的已知键；缺键/坏值一律按 0（旧文件/手工改过的行不该让
+/// 收尾崩掉）。`cachedReported` 记"这一行有没有 cached 键"。
+class _UsageAccum {
+  const _UsageAccum({
+    required this.runs,
+    required this.turns,
+    required this.reportedTurns,
+    required this.unreportedTurns,
+    required this.prompt,
+    required this.out,
+    required this.cached,
+    required this.cachedReported,
+    required this.steadyHitRate,
+  });
+
+  static const zero = _UsageAccum(
+    runs: 0,
+    turns: 0,
+    reportedTurns: 0,
+    unreportedTurns: 0,
+    prompt: 0,
+    out: 0,
+    cached: 0,
+    cachedReported: false,
+    steadyHitRate: null,
+  );
+
+  final int runs;
+  final int turns;
+  final int reportedTurns;
+  final int unreportedTurns;
+  final int prompt;
+  final int out;
+  final int cached;
+  final bool cachedReported;
+  final double? steadyHitRate;
+
+  static int _intOf(Object? v) => v is num ? v.toInt() : 0;
+
+  factory _UsageAccum.fromRow(Map<String, dynamic> row) => _UsageAccum(
+        runs: _intOf(row['runs']),
+        turns: _intOf(row['turns']),
+        reportedTurns: _intOf(row['reportedTurns']),
+        unreportedTurns: _intOf(row['unreportedTurns']),
+        prompt: _intOf(row['prompt']),
+        out: _intOf(row['out']),
+        cached: _intOf(row['cached']),
+        cachedReported: row.containsKey('cached'),
+        steadyHitRate:
+            row['steadyHitRate'] is num ? (row['steadyHitRate'] as num).toDouble() : null,
+      );
 }
 
 /// `HeraclesEvent` → UI `AgentEvent` 的翻译器（带轮次/步骤状态）。
@@ -2475,11 +3108,60 @@ class _Translator {
     ));
   }
 
+  /// **任务被策略停下**（V0.4 `run_stopped`，只增事件）。
+  ///
+  /// 与 [failed] 的区别：failed = 出错；这里是"没做完但可继续"（轮数/token 预算/
+  /// 无进展/超时/进程被杀/用户取消）。UI 用它渲染"任务被中断 + 继续"卡。
   void failed(String message) {
     // 失败也要先把正文发完：`_reportRunFailure` 之后这条 run 就结束了，
     // 留在队列里的片永远没有出口（且其中可能有**已经生成好的正文**）。
     _flushText();
     _sink(AgentEvent(type: AgentEvent.kFailed, ts: _now, index: _turn, message: message));
+  }
+
+  /// **V0.4 `run_stopped`**（N14）：强类型字段 + 兼容 raw JSON。
+  ///
+  /// raw JSON 是为了兼容前端已有的 `RunStopInfo.fromEvent` 适配层；
+  /// 强类型字段落地后前端可直接读 `AgentEvent.runStop*`。
+  void runStopped(
+    String reason, {
+    required int round,
+    required int maxRounds,
+    required int tokensSpent,
+    required int tokensLimit,
+    int? nextEstimate,
+    required bool canContinue,
+    List<String> changedFiles = const <String>[],
+    String? errorSummary,
+    int? resumedFromRound,
+  }) {
+    final payload = <String, Object?>{
+      'reason': reason,
+      'round': round,
+      'maxRounds': maxRounds,
+      'tokensSpent': tokensSpent,
+      'tokensLimit': tokensLimit,
+      'nextEstimate': ?nextEstimate,
+      'canContinue': canContinue,
+      'changedFiles': changedFiles,
+      'errorSummary': ?errorSummary,
+      'resumedFromRound': ?resumedFromRound,
+    };
+    _sink(AgentEvent(
+      type: AgentEvent.kRunStopped,
+      ts: _now,
+      raw: jsonEncode(payload),
+      runStopReason: reason,
+      runStopRound: round,
+      runStopMaxRounds: maxRounds,
+      runStopTokensSpent: tokensSpent,
+      runStopTokensLimit: tokensLimit,
+      runStopNextEstimate: nextEstimate,
+      runStopCanContinue: canContinue,
+      runStopChangedFiles: changedFiles,
+      runStopErrorSummary: errorSummary,
+      runStopResumedFromRound: resumedFromRound,
+    ));
   }
 }
 

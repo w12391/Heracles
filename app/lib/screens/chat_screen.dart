@@ -21,11 +21,15 @@ import '../services/agent_bridge.dart';
 import '../services/device_capabilities.dart';
 import '../services/jev_service.dart';
 import '../services/model_context_table.dart';
+import '../services/session_store.dart';
 import '../services/settings_controller.dart';
 import '../theme/app_theme.dart';
 import '../theme/cupertino_kit.dart';
 import '../theme/pressable.dart';
 import 'settings_screen.dart';
+import 'automation_screen.dart';
+import 'mcp_screen.dart';
+import 'skills_screen.dart';
 import 'archived_sessions_screen.dart';
 import 'jev_settings_screen.dart';
 import '../widgets/bw_topbar.dart';
@@ -39,6 +43,7 @@ import '../services/github_auth.dart';
 import '../services/git_service.dart';
 import '../services/github_config.dart';
 import '../widgets/bw_approval.dart';
+import '../widgets/run_stop_banner.dart';
 import '../widgets/themed_background.dart';
 import '../widgets/input_bar.dart';
 import '../widgets/message_row.dart';
@@ -561,10 +566,12 @@ class _ChatScreenState extends State<ChatScreen> {
   //
   // 现在的行为（与需求逐条对应）：
   //   · 成功完成 ⇒ 先给完成态看 4 秒，然后淡出 + 清空；
-  //   · 用户 4 秒内点过灵动岛 ⇒ **取消自动隐藏**（保持到下一轮/切会话）；
+  //   · **完成后的 4 秒窗口内**点过灵动岛 ⇒ 取消自动隐藏（保持到下一轮/切会话）；
+  //   · **运行中**点岛只是展开/收起 —— 不阻断完成后的自动消失（T1-3：旧实现
+  //     把"看过一眼"记成永久常驻，用户实测完成态永不消失）；
   //   · 失败/中断 ⇒ **不隐藏**（用户要知道为什么），10 秒后只自动收起成一行，
   //     原因保留；
-  //   · 新 run / 新计划 / 计划被空帧收起 ⇒ 计时器作废。
+  //   · 新 run / 新计划 / 计划被空帧收起 / 切会话 ⇒ 计时器作废。
 
   /// 完成态停留多久后自动淡出（用户定：4 秒）。
   static const Duration _kPlanAutoHideAfter = Duration(seconds: 4);
@@ -582,7 +589,18 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _planAutoCollapseTimer;
 
   /// 用户点过灵动岛 = 正在查看 ⇒ 取消自动隐藏（保持到下一轮）。
+  ///
+  /// ★ 2026-10-30 P0（T1-3）：**只有"完成后 4 秒窗口内"的点击**才会置它
+  ///   （见 [_planHideWindowOpen] 与 onToggle）。运行中点岛不置 —— 否则完成
+  ///   时的 [_schedulePlanAutoHide] 会直接 return，完成态永久常驻。
   bool _planUserInspecting = false;
+
+  /// "完成后的 4 秒自动隐藏窗口"是否开着。
+  ///
+  /// 完成 ⇒ [_schedulePlanAutoHide] 打开窗口并排计时；4 秒到点开始淡出时关窗。
+  /// 只有窗口内的点岛才允许取消自动隐藏（用户明确说"别消失"）；
+  /// 窗口外/完成前的点岛都只是展开/收起，不许阻断自动消失。
+  bool _planHideWindowOpen = false;
 
   /// 正在淡出（opacity → 0）；动画结束才清空计划字段。
   bool _planFadingOut = false;
@@ -612,6 +630,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// 提问抽屉此刻是否开着（开着时不重复弹，气泡先隐藏）。
   bool _askSheetOpen = false;
+
+  // ---- ★ V0.4 长任务续跑（#1，2026-11-02）----
+  //
+  // 任务被中断时后端发 `run_stopped`；这里存下来渲染「任务被中断」卡。
+  // 续跑固定自动 3 轮（2026-11-02 用户裁定，不开放设置）。
+  RunStopInfo? _runStop;
+
+  /// 事件流 `kFailed` 带回来的原始失败原因（V0.4 T0）。
+  /// 即使 `run()` 正常返回，也要靠它把原因写进会话流。
+  String? _lastFailureMessage;
 
   /// 忙时输入框是否仍可用 —— 由用户的 `BusySendBehavior` 决定。
   ///
@@ -687,6 +715,40 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 正在从磁盘读会话历史
   bool _loadingHistory = false;
 
+  /// 当前会话还有**更早的消息没加载**（T0-2，2026-10-31）。
+  ///
+  /// ## 为什么需要这个状态
+  ///
+  /// 长会话（文件 > 通道 1MB 文本上限）不可能一次全读：`SessionStore` 在
+  /// `limit:0` 时自动读**尾部**（`ContractSession.tailLoadLines` 行），并在
+  /// 返回列表**头插**一条 `_synthetic:"paging"` 的 `role:system` 行（带
+  /// `hasEarlier`/`truncatedAtHead`）。
+  ///
+  /// 那条合成行**不是会话内容**：旧实现把它画成一条 assistant 气泡
+  ///（用户看到"会话记录超过通道 1MB 上限…"，像是模型说的话）。现在它只
+  /// 负责置这个标记 ⇒ 列表顶部显示「更早消息未加载」横幅。
+  ///
+  /// ## 翻页（2026-10-31 已接）
+  ///
+  /// 点横幅用 `SessionStore.loadMessages(limit, offset)` 取上一窗口：
+  /// `offset` = 已加载的**文件行数**（合成提示行不计），`limit` = 每页行数。
+  /// 桥接 `AgentBridge.loadMessages` 还没转发这两个参数（已移交后端线），
+  /// 所以这里**临时直连** `SessionStore`（纯 Dart，同一 `heracles/device`
+  /// 通道；桥接补齐后把 `_pagingStore` 换成 `_bridge` 调用即可）。
+  bool _historyHasEarlier = false;
+
+  /// 已加载的会话**文件行数**（= 下一次翻页的 `offset`）。
+  ///
+  /// 只数真实落盘行：合成分页行、读取失败提示行都不算 —— 否则 offset
+  /// 会虚高，翻页时漏掉/重复一行。
+  int _historyLinesLoaded = 0;
+
+  /// 每页行数（T0-2）。200 行 ≈ 一屏半到两屏，翻一次就有明显内容。
+  static const int _kHistoryPageLines = 200;
+
+  /// 正在加载更早消息（按钮态：转圈 + 防连点）。
+  bool _historyLoadingEarlier = false;
+
   // ---- 会话列表缓存（2026-10-23）----
   //
   // ## 为什么需要（task 3：减少 `_reload` 的串行 IPC）
@@ -732,6 +794,8 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 平台侧会一直持有 sink，每次进页面都多一条订阅。
   StreamSubscription<AgentEvent>? _eventSub;
   StreamSubscription<Map<String, String>>? _openSessionSub;
+  /// 宿主"刚登记了一个新工作区"的推送（SAF 期间 Activity 被回收时靠它刷新）。
+  StreamSubscription<Map<String, dynamic>>? _workspaceAddedSub;
 
   /// 当前「正在生成…」占位行的 id（同一轮复用，不重复插入）
   String? _progressId;
@@ -1054,6 +1118,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _scroll.addListener(_onScroll);
     // ★ 通知点击定位会话（2026-10-19）：热启动走广播流，冷启动走 pending 兜底
     _openSessionSub = AgentBridge.openSessionRequests.listen(_onOpenSessionRequest);
+    // ★ 2026-11-02（T0）：SAF 期间 Activity 被系统回收 ⇒ Flutter 引擎一起重建，
+    //   本页面是**全新的一份**。新目录要等 Kotlin 在 onActivityResult 里登记完才
+    //   存在，而那时首屏的 `listWorkspaces()` 早跑过了。宿主登记成功会推一条，
+    //   收到就重载 —— 否则用户会以为"又没选上"。
+    _workspaceAddedSub = AgentBridge.workspaceAdded.listen((_) {
+      unawaited(_reload(silent: true));
+    });
     // ★ 2026-10-28：读 GitHub 连接状态（见 _githubAccount 的注释 ——
     //   不读的话底部永远显示「连接 Github」，即使已经连上了）
     unawaited(_loadGitHubAccount());
@@ -1061,7 +1132,19 @@ class _ChatScreenState extends State<ChatScreen> {
     unawaited(_refreshGitBranch());
     _restoreView();
     unawaited(_jev.load());
-    unawaited(_reload().then((_) => _consumePendingOpenSession()));
+    // ★ 2026-11-02（T0）：冷启动（含"进程被系统杀掉后重开"）要回到**上次那个
+    //   工作区的那个会话**，而不是第一个工作区的空态。顺序很重要：
+    //   先 `_reload` 拿到工作区与会话，再恢复选中，最后才处理通知点进来的请求
+    //   （外部请求优先级更高，不能被本地记录盖掉）。
+    unawaited(
+      _reload()
+          .then((_) => _restoreActiveSession())
+          .then((_) => _consumePendingOpenSession()),
+    );
+    // ★ V0.4（#1）：续跑固定自动 3 轮，不读设置。
+    // ★ T1-1（2026-10-31）：首屏进入就刷一次上下文占用 —— 冷启动时用户
+    //   可能直接落在"上次的会话"上，不刷新顶栏就是「上下文 —」。
+    unawaited(_refreshContextUsage());
   }
 
   /// **完成通知点击 → 打开对应会话**（2026-10-19）。
@@ -1131,6 +1214,76 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (_) {
       // 忽略 —— 用默认值
+    }
+  }
+
+  // ------------------------------------------------ 上次会话的落盘与恢复（T0）
+
+  /// 「上次停在哪个会话」的存储键。
+  ///
+  /// 为什么需要它：进程被系统杀掉（`onDestroy`/`onCreate` 都可能没走全）后
+  /// 冷启动，`_activeSessionId` 是 null ⇒ 界面回到"第一个工作区 + 空聊天"。
+  /// 用户刚选完文件夹、以为工作没了，就会以为"是刚才那个 bug 又来了"。
+  static const _kLastSession = 'last_session_v1';
+
+  /// 记下"当前停在哪个工作区的哪个会话"。
+  ///
+  /// ⚠️ 没有选中会话时**什么都不做**（不是清除）。因为 `_reload()` 结束时会调
+  /// 它，而冷启动第一次 `_reload` 时 `_activeSessionId` 本来就是 null ——
+  /// 那时若"顺手清掉记录"，就永远恢复不了。清除只走显式的 [_clearLastSession]。
+  Future<void> _persistActiveSession() async {
+    final id = _activeSessionId;
+    if (id == null) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString(
+        _kLastSession,
+        jsonEncode({'workspace': _activeWorkspace?.path ?? '', 'sessionId': id}),
+      );
+    } catch (_) {
+      // 落盘失败不该影响任何功能
+    }
+  }
+
+  /// 用户主动切到"没有会话"的状态（换工作区 / 删掉当前会话）时清记录。
+  Future<void> _clearLastSession() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.remove(_kLastSession);
+    } catch (_) {
+      // 同上
+    }
+  }
+
+  /// 冷启动后恢复上次的会话。
+  ///
+  /// 三道校验，任一不满足就**安静放弃**（回到默认的空态，不弹错）：
+  /// 1. 已经有选中的会话（通知点进来等外部请求优先）；
+  /// 2. 记录里的工作区还在、且会话真的存在于该工作区（目录可能被删/被移除）；
+  /// 3. 恢复过程本身不抛（脏记录不该让首页打不开）。
+  Future<void> _restoreActiveSession() async {
+    if (_activeSessionId != null) return;
+    if (_pendingOpenRequest != null) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      final raw = p.getString(_kLastSession);
+      if (raw == null) return;
+      final m = jsonDecode(raw);
+      if (m is! Map) return;
+      final sid = (m['sessionId'] as String?) ?? '';
+      final wsPath = (m['workspace'] as String?) ?? '';
+      if (sid.isEmpty) return;
+      for (final w in _workspaces) {
+        if (wsPath.isNotEmpty && w.path != wsPath) continue;
+        if (!w.exists) continue;
+        if (!w.sessions.any((s) => s.id == sid)) continue;
+        if (!mounted) return;
+        // popFirst: false —— 这里是首页自己恢复，不是从抽屉点进来的
+        await _selectSession(w.id, sid, popFirst: false);
+        return;
+      }
+    } catch (_) {
+      // 忽略 —— 用默认（不选会话）状态
     }
   }
 
@@ -1213,6 +1366,9 @@ class _ChatScreenState extends State<ChatScreen> {
         _workspaces = list;
         _loading = false;
       });
+      // 列表刷新后顺手记下"当前停在哪个会话"—— 进程被杀后冷启动靠它恢复
+      // （`_persistActiveSession` 在没有选中会话时是 no-op，不会清掉记录）。
+      unawaited(_persistActiveSession());
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -1315,10 +1471,36 @@ class _ChatScreenState extends State<ChatScreen> {
       //   否则上一个工作区某会话的结果会串进新工作区的列表。
       _switchContext();
       setState(() => _activeSessionId = null);
+      unawaited(_clearLastSession());
       await _reload();
     } catch (e) {
       if (!mounted) return;
-      setState(() => _error = '$e');
+      // ★ 2026-11-02（T0 SAF 黑屏）：**不许**只挂一行红字就完事。
+      //
+      // 两条路会走到这里：
+      // · 超时 —— 选择器期间 Activity 被系统回收，结果丢了（Kotlin 已用
+      //   进程级登记 + requestId 尽力找回，找不回才是这里）；
+      // · 桥接异常 —— 插件没就绪等。
+      //
+      // 两种都需要"下一步能点"，所以复用「可操作的失败提示」抽屉：
+      // 它自带两条出路（重试 / 改用默认工作区），比一句错误文本有用得多。
+      await _showPickWorkspaceFailure({
+        'ok': false,
+        'reasonCode': 'pick_failed',
+        'error': '$e',
+        'suggest': [
+          {
+            'action': 'pick_subfolder',
+            'title': '重试选择文件夹',
+            'detail': '再打开一次系统选择器。若仍被系统回收，改用「默认工作区」最稳。',
+          },
+          {
+            'action': 'use_app_workspace',
+            'title': '使用「默认工作区」',
+            'detail': 'App 自带目录，不经过系统选择器，不会再被回收。',
+          },
+        ],
+      });
     }
   }
 
@@ -1350,8 +1532,13 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _showPickWorkspaceFailure(Map<String, dynamic> ws) async {
     final error = (ws['error'] as String?)?.trim() ?? '';
     final reason = (ws['reasonCode'] as String?)?.trim() ?? '';
-    // 标题按原因分：网盘（无本地路径）与系统受限是两回事，措辞要准。
-    final title = reason == 'no_local_path' ? '这个位置没有本地文件夹' : '这个文件夹不能用作工作区';
+    // 标题按原因分：网盘（无本地路径）、系统受限、选择结果没回来，是三回事。
+    final title = switch (reason) {
+      'no_local_path' => '这个位置没有本地文件夹',
+      // 超时/桥接失败：不是"文件夹不行"，而是"根本没拿到文件夹"
+      'pick_failed' => '没能收到选择结果',
+      _ => '这个文件夹不能用作工作区',
+    };
 
     // Kotlin 给的出路；老版本/`no_local_path` 分支没带 ⇒ 用同样的两条兜底。
     final suggestions = <({String action, String title, String detail})>[];
@@ -1589,6 +1776,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _activeSessionId = id;
         _messages.clear();
         _metrics.clear();
+        // ★ T1-4：新建会话 = 新账本（见 _newSession）。
+        _usageBySession.remove(id);
         _error = null;
       });
       await _reload();
@@ -1655,6 +1844,9 @@ class _ChatScreenState extends State<ChatScreen> {
       _activeSessionId = id;
       _messages.clear();
       _metrics.clear();
+      // ★ T1-4（2026-10-31）：新建会话 = 新的一本用量账 —— 防御性清掉同 id
+      //   的旧累计（正常不会有），保证显示的一定是这个会话自己的数。
+      _usageBySession.remove(id);
       _error = null;
     });
     await _reload(silent: true);
@@ -1703,6 +1895,11 @@ class _ChatScreenState extends State<ChatScreen> {
       _metrics.clear();
       _error = null;
       _loadingHistory = true;
+      // ★ T1-1（2026-10-31）：上下文占用属于**上一个会话**，切换/加载前先复位，
+      //   否则顶栏会短暂显示上个会话的环数（甚至把「—」拖到新会话）。
+      _contextLimit = -1;
+      _frozenTokens = -1;
+      _contextBreakdown = const <String, int>{};
     });
 
     try {
@@ -1712,12 +1909,38 @@ class _ChatScreenState extends State<ChatScreen> {
         treeUri: _treeUriOf(workspaceId),
       );
       if (!mounted) return;
+      // ★ T1-4（2026-10-31）：从落盘行恢复"本会话累计用量"。
+      //
+      // 用户报的现象：切会话/重启后顶栏命中率变回「—」—— 因为 `_usageBySession`
+      // 只在 run 收尾时写内存，`_toMessages` 对 `role:"usage"` 行又直接 break。
+      // 现在后端每 run 收尾追加一条 `role:"session_usage"` 累计汇总行，这里读它。
+      //
+      // 规则全在 [sessionUsageFromRows]（有汇总行**只认汇总**，绝不与旧累计行
+      // 叠加；旧会话没有汇总行才用 assistant/usage 行降级累计；无数据 ⇒ 清掉
+      // 旧 key，UI 显示「—」，不编 0%）。
+      final restoredUsage = sessionUsageFromRows(raw);
       setState(() {
         _messages
           ..clear()
           ..addAll(_toMessages(raw));
+        // ★ T0-2：记下这次读了多少**文件行** —— 翻页 offset 从这里起算。
+        _historyLinesLoaded = _sessionLinesOf(raw);
+        _historyLoadingEarlier = false;
+        if (restoredUsage != null) {
+          _usageBySession[sessionId] = restoredUsage;
+        } else {
+          // 没有可恢复的数据 = 这个会话真的没有用量账本（新建/清空过）——
+          // 不能留着上一轮切走前的内存旧值冒充它。
+          _usageBySession.remove(sessionId);
+        }
         _loadingHistory = false;
       });
+
+      // ★ T1-1（2026-10-31）：会话加载完成立刻刷新上下文占用 ——
+      //   旧实现只在"打开用量抽屉 / run 结束"时刷新，冷启动直接进历史会话时
+      //   `_contextLimit` 还是初值 -1 ⇒ 顶栏永远「上下文 —」，直到用户点开
+      //   用量抽屉才突然有数（真机复现）。刷新失败保持「—」，不编 0%。
+      unawaited(_refreshContextUsage());
 
       // ★ 切回一个**仍在运行**的会话 → 重连事件订阅（2026-10-11，t11 的 #3）
       //
@@ -1758,13 +1981,31 @@ class _ChatScreenState extends State<ChatScreen> {
   /// {"role":"assistant","text":"...","cached":1024,"prompt":1200,"out":50,"ms":6530}
   /// ```
   List<HMessage> _toMessages(List<Map<String, dynamic>> raw) {
-    // ★ 计划恢复（M2，2026-10-24）：取**最后一条** plan 行还原顶部清单。
-    //   副作用写在转换器里（重载必经之路）；实时路径不受影响
-    //   （plan_created 事件照常覆盖这些字段）。
-    //   ★ 2026-10-30 P0：已完成的计划**不恢复**（见 restoredPlanFromRow）。
-    for (final m in raw) {
-      final restored = restoredPlanFromRow(m);
-      if (restored == null) continue;
+    // ★ T0-2（2026-10-31）：分页状态由本批行决定 —— 每次重放先复位
+    //   （合成分页行只在"还有更早"时出现，见下面的 case 'system'）。
+    _historyHasEarlier = false;
+    // ★ 计划恢复（M2，2026-10-24 / T1-3 2026-10-31 修正）：只认**最后一条**
+    //   `role:"plan"` 行。
+    //
+    // ## 旧实现为什么让"已完成任务"的岛复活
+    //
+    // 旧代码逐行 `restoredPlanFromRow(m)` 并 `continue`：同一 run 的 JSONL 里
+    // 常见「4/5 未完成」→「5/5 reachedGoal:true」两帧；最后那帧返回 null 时
+    // 只是 continue，**前面 4/5 的快照就留在了字段里** ⇒ 切会话/杀进程重开后
+    // 顶上一个"4/5 进行中"的岛常驻，而任务其实早完成了。
+    //
+    // 现在：先找最后一条 plan 行，只应用它；它是已完成/空计划 ⇒ 清空状态。
+    final restored = restoredPlanFromRows(raw);
+    if (restored == null) {
+      // 最后一条是"已完成/全 cancelled/空计划"，或这批行没有任何 plan
+      // （新会话/纯对话）⇒ 不恢复，并清空旧快照
+      _planSteps = null;
+      _planDone = 0;
+      _planActive = 0;
+      _planCancelled = const {};
+      _planReachedGoal = null;
+      _planClosedReason = null;
+    } else {
       _planSteps = restored.steps;
       _planDone = restored.done;
       _planActive = restored.active;
@@ -1868,6 +2109,15 @@ class _ChatScreenState extends State<ChatScreen> {
             wallMs: (m['ms'] as num?)?.toInt() ?? 0,
           );
         case 'system':
+          // ★ T0-2（2026-10-31）：SessionStore 的**合成分页提示行**
+          //   （`_synthetic:"paging"`，尾部读取时插在列表头）不是会话内容
+          //   —— 不产出气泡。旧实现把它画成 assistant 气泡，用户看到
+          //   「会话记录超过通道 1MB 上限…」会以为是模型说的话。
+          //   现在只置分页状态，由列表顶部的「更早消息未加载」横幅承载。
+          if (m['_synthetic'] == 'paging') {
+            _historyHasEarlier = true;
+            break;
+          }
           // 读取出错时的提示 —— 必须显示，否则用户以为记录真的没了
           out.add(HAssistantMessage(id: id, text: text));
           final sysTs = (m['ts'] as num?)?.toInt();
@@ -1979,6 +2229,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     await _bridge.deleteSession(workspaceId, sessionId,
         treeUri: _treeUriOf(workspaceId));
+    // ★ T1-4：会话被删 ⇒ 它的用量账本也从内存里清掉（删的可能是非当前会话）。
+    _usageBySession.remove(sessionId);
     // 会话被删 ⇒ 缓存失效（删的可能是**非当前**会话，不会经过 _switchContext）
     _invalidateSessionCache();
     if (sessionId == _activeSessionId) {
@@ -2071,6 +2323,8 @@ class _ChatScreenState extends State<ChatScreen> {
     var deletedActive = false;
     for (final (wid, sid) in items) {
       await _bridge.deleteSession(wid, sid, treeUri: _treeUriOf(wid));
+      // ★ T1-4：删掉的会话不再留着用量账本。
+      _usageBySession.remove(sid);
       if (sid == _activeSessionId) deletedActive = true;
     }
     _invalidateSessionCache();
@@ -2081,6 +2335,9 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages.clear();
         _metrics.clear();
       });
+      // 当前会话被删 ⇒ 上次会话的记录也要一起清，否则下次冷启动会去恢复一个
+      // 已经不存在的会话（虽然会被校验挡住，但留脏数据没意义）。
+      unawaited(_clearLastSession());
     }
     await _reload();
   }
@@ -2091,6 +2348,92 @@ class _ChatScreenState extends State<ChatScreen> {
       if (w.id == workspaceId) return w.treeUri;
     }
     return '';
+  }
+
+  /// 取某个工作区的**绝对路径**（`SessionStore` 与文件操作都要它）
+  String? _workspacePathOf(String workspaceId) {
+    for (final w in _workspaces) {
+      if (w.id == workspaceId) return w.path;
+    }
+    return null;
+  }
+
+  /// 本次读回的**真实文件行数**（T0-2 翻页 offset 的度量）。
+  ///
+  /// 排除两类**不是会话内容**的行：
+  /// · `_synthetic:"paging"` —— SessionStore 头插的分页提示行；
+  /// · 读取失败时尾插的 `role:system` 提示行（`…后面的消息没有显示。`）。
+  /// 不排除的话 offset 虚高，翻页会漏行或重复。
+  static int _sessionLinesOf(List<Map<String, dynamic>> rows) {
+    var n = 0;
+    for (final m in rows) {
+      if (m['_synthetic'] == 'paging') continue;
+      final text = (m['text'] as String?) ?? '';
+      if (m['role'] == 'system' && text.endsWith('后面的消息没有显示。')) {
+        continue;
+      }
+      n++;
+    }
+    return n;
+  }
+
+  /// **加载更早消息**（T0-2，2026-10-31）。
+  ///
+  /// 取上一页（`limit: 每页行数 + 1`、`offset: 已加载行数`）：
+  /// · 多要 1 行是为了判断"还有没有更早" —— 返回 > 每页行数 ⇒ 还有；
+  ///   正好 <= 每页行数 ⇒ 到头了，横幅消失；
+  /// · 合并时**插到最前**并保持滚动位置：记下插入前后的 `maxScrollExtent`
+  ///   差值，插完把 `pixels` 同步加上差值 —— 用户眼里的内容不跳；
+  /// · 去重靠 offset 连续性（窗口不重叠），不靠文本比对（消息可以重复）。
+  Future<void> _loadEarlierMessages() async {
+
+    final wsId = _activeWorkspace?.id;
+    final sid = _activeSessionId;
+    final path = wsId == null ? null : _workspacePathOf(wsId);
+    if (sid == null || path == null || path.isEmpty) return;
+
+    setState(() => _historyLoadingEarlier = true);
+    try {
+      // 直连 SessionStore（桥接未转发 limit/offset；见 `_historyHasEarlier` 注释）。
+      final store = SessionStore(workspaceRoot: path);
+      final rows = await store.loadMessages(
+        sid,
+        limit: _kHistoryPageLines + 1,
+        offset: _historyLinesLoaded,
+      );
+      if (!mounted) return;
+      final lines = _sessionLinesOf(rows);
+      if (lines <= 0) {
+        // 窗口空了 = 确实没有更早的了
+        setState(() {
+          _historyHasEarlier = false;
+          _historyLoadingEarlier = false;
+        });
+        return;
+      }
+      final older = _toMessages(rows); // 内部会按合成行临时改 _historyHasEarlier
+      final before = _scroll.hasClients ? _scroll.position.pixels : null;
+      final beforeMax =
+          _scroll.hasClients ? _scroll.position.maxScrollExtent : null;
+      setState(() {
+        _messages.insertAll(0, older);
+        _historyLinesLoaded += lines;
+        // 多要了 1 行还拿到 > 每页 ⇒ 前面还有
+        _historyHasEarlier = lines > _kHistoryPageLines;
+        _historyLoadingEarlier = false;
+      });
+      if (before != null && beforeMax != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !_scroll.hasClients) return;
+          final delta = _scroll.position.maxScrollExtent - beforeMax;
+          final target = (before + delta)
+              .clamp(0.0, _scroll.position.maxScrollExtent);
+          if (target.isFinite) _scroll.jumpTo(target);
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _historyLoadingEarlier = false);
+    }
   }
 
   HSession? _findSession(String workspaceId, String sessionId) {
@@ -2119,6 +2462,23 @@ class _ChatScreenState extends State<ChatScreen> {
         onOpenArchived: _openArchivedPage,
       ),
     ));
+  }
+
+  /// **自动化任务页**（2026-11-02：入口从设置页移到抽屉 —— 用户裁定三个
+  /// 智能体入口放主页侧边栏，单一入口避免两处维护）。
+  void _openAutomation() => _openFromDrawer(const AutomationScreen());
+
+  void _openSkills() => _openFromDrawer(const SkillsScreen());
+
+  void _openMcp() => _openFromDrawer(const McpScreen());
+
+  /// 从抽屉进二级页的共用路径：先关抽屉（只有从抽屉进来才需要 ——
+  /// 同 [_openSettings] 里 2026-10-19 的坑），再 push。
+  void _openFromDrawer(Widget page) {
+    if (_scaffoldKey.currentState?.isDrawerOpen ?? false) {
+      Navigator.of(context).pop();
+    }
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
   }
 
   /// **已归档对话页**（从设置打开）：快照取当前工作区列表里的
@@ -2171,17 +2531,6 @@ class _ChatScreenState extends State<ChatScreen> {
               children: [
                 // ★ 抓手必须有（2026-10-29 用户实报图 6：这张抽屉
                 // 漏了抓手，看着不像上拉抽屉 —— 其余 bw 抽屉都有）。
-                Center(
-                  child: Container(
-                    width: 36,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: h.border,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 8),
                 // 顺序：相机在照片上面（2026-10-29 用户指定）。
                 _sheetPickRow(
                   h,
@@ -2630,11 +2979,14 @@ class _ChatScreenState extends State<ChatScreen> {
   // ==========================================================================
 
   /// 作废所有计划计时器（新计划/新 run/用户点击/切上下文都要调）。
+  ///
+  /// 顺带关闭"完成后的 4 秒窗口"：计时器没了，就没有可被取消的自动隐藏了。
   void _cancelPlanTimers() {
     _planAutoHideTimer?.cancel();
     _planAutoHideTimer = null;
     _planAutoCollapseTimer?.cancel();
     _planAutoCollapseTimer = null;
+    _planHideWindowOpen = false;
   }
 
   /// 彻底清空计划状态（调用方负责 setState；内部会顺手作废计时器）。
@@ -2650,13 +3002,23 @@ class _ChatScreenState extends State<ChatScreen> {
     _planFadingOut = false;
   }
 
-  /// 成功完成 ⇒ 4 秒后淡出并清空（用户点过岛则保持）。
+  /// 成功完成 ⇒ 4 秒后淡出并清空。
+  ///
+  /// ★ 2026-10-30 P0（T1-3）：**完成时无条件安排**。旧实现开头
+  ///   `if (_planUserInspecting) return;` 把"运行中点过岛"也当成取消条件，
+  ///   于是完成态永不消失（用户实测的 bug 真身）。现在 [_planUserInspecting]
+  ///   只可能在"完成后 4 秒窗口内"被置（见 onToggle），所以这里不会误伤；
+  ///   运行中点岛只是展开/收起，挡不住完成后的自动消失。
   void _schedulePlanAutoHide() {
     _cancelPlanTimers();
     if (_planSteps == null || _planSteps!.isEmpty) return;
+    // 只在"完成后窗口内点过岛"时为 true —— 那是用户明确要求别再自动消失。
     if (_planUserInspecting) return;
+    _planHideWindowOpen = true;
     _planAutoHideTimer = Timer(_kPlanAutoHideAfter, () {
       if (!mounted) return;
+      // 4 秒已过 ⇒ 窗口关闭：此刻起（淡出中）点岛不再能取消。
+      _planHideWindowOpen = false;
       setState(() => _planFadingOut = true);
       // 淡出动画走完（AnimatedOpacity 同值）再清空 —— 不要闪跳。
       // 这一拍也挂在同一个字段上，保证 dispose / 新计划能把它取消掉。
@@ -2952,6 +3314,19 @@ class _ChatScreenState extends State<ChatScreen> {
               };
             }
           });
+          // ★ 2026-10-30 P0（T1-3）兜底：这份权威帧已经是"全终态"
+          //   （done/cancelled 覆盖全部步骤、且没有 active 步），说明任务
+          //   已经跑完了；但收尾可能只发 plan_updated、没有 plan_closed
+          //   （老后端/异常收尾）—— 这时也必须安排自动隐藏，否则完成态
+          //   会像以前一样常驻。
+          //   ⚠️ 明确中断（plan_closed reachedGoal:false）不走这里：那时
+          //      原因必须留给用户看，仍由 _schedulePlanAutoCollapse 走 10 秒收起。
+          final allTerminal = detailed.isNotEmpty &&
+              _planDone >= detailed.length &&
+              _planActive < 0;
+          if (allTerminal && _planReachedGoal != false) {
+            _schedulePlanAutoHide();
+          }
         }
 
       // ---- ★ 上下文分项帧（N2，2026-10-25 后端升级形状）----
@@ -3023,6 +3398,12 @@ class _ChatScreenState extends State<ChatScreen> {
       case AgentEvent.kAskClosed:
         _onAskClosed(e.outcome);
 
+      // ★ V0.4（2026-11-02，对应 #1）：长任务被中断。
+      //   `run_stopped`（只增事件）—— 字段见 `RunStopInfo.fromEvent` 的契约适配。
+      //   收到后显示「任务被中断：<人话原因>」+ 继续按钮（canContinue 决定可用）。
+      case RunStopInfo.kRunStoppedEvent:
+        unawaited(_onRunStopped(e));
+
       // ---- ★ 危险工具审批（2026-10-19）----
       //
       // 到达时机：Kotlin 侧已经**挂起**在审批队列上（工具返回 NeedsApproval）。
@@ -3047,6 +3428,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // 避免同一条回答出现两次。
       case AgentEvent.kFinished:
       case AgentEvent.kFailed:
+        _lastFailureMessage = e.message;
         setState(() {
           _appendAllPendingRaw();
           final pid = _progressId;
@@ -3569,6 +3951,13 @@ class _ChatScreenState extends State<ChatScreen> {
       //   就可能顶着「回到底部」按钮，或者明明在底部却不跟随。
       _stickToBottom = true;
       _hasNewContent = false;
+      // ★ T0-2：分页状态属于**旧列表** —— 换会话/新建/删会话后必须复位，
+      //   否则新会话顶上会残留「更早消息未加载」（假入口比没有更糟）。
+      _historyHasEarlier = false;
+      _historyLinesLoaded = 0;
+      _historyLoadingEarlier = false;
+      // ★ V0.4（#1）：中断卡属于**旧会话/旧 run** —— 切上下文必须清掉
+      _runStop = null;
       // 压缩提示是**实时流**的瞬态提示（不落盘）：换会话后不该残留 ——
       // 它是"那个会话当时发生过"的事，锚点也属于旧列表。
       _compressedNotes.clear();
@@ -4068,16 +4457,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    // iOS 风格抓手
-                    Container(
-                      width: 36,
-                      height: 5,
-                      margin: const EdgeInsets.only(top: HSpace.sm),
-                      decoration: BoxDecoration(
-                        color: h.border,
-                        borderRadius: BorderRadius.circular(HRadius.pill),
-                      ),
-                    ),
                     Padding(
                       padding: const EdgeInsets.fromLTRB(
                           HSpace.lg, HSpace.md, HSpace.xs, HSpace.xs),
@@ -4413,6 +4792,9 @@ class _ChatScreenState extends State<ChatScreen> {
       await _doCompact();
       return;
     }
+    // ★ V0.4（#1）：新一轮开始 ⇒ 上一轮的中断卡作废（别让旧"被中断"常驻）
+    if (_runStop != null) setState(() => _runStop = null);
+    _lastFailureMessage = null;
     // ★ 2026-10-30 P0：新一轮开始前撤掉上一轮**已完成**的计划 ——
     //   否则旧计划的完成态会盖住新任务（灵动岛常驻的另一种表现）。
     _clearCompletedPlanOnNewRun();
@@ -4746,12 +5128,27 @@ class _ChatScreenState extends State<ChatScreen> {
       // 所以即使用户切走了（`stillHere == false`），这笔账也要记到 A，
       // 而不是丢掉 —— 否则 A 的用量会随"切走时机"随机少算。
       _accrueRunUsage(origin, result);
+
+      // ★ V0.4 T0（2026-11-02）：**非用户主动中断必须把失败原因写进会话流**。
+      //
+      // 旧实现只在 `catch` 里报错；但 `AgentBridge.run()` 在 backend 发
+      // `HeraclesFailed` 后是**正常返回**的（stopReason='运行失败'）——
+      // 于是 UI 只收尾、不显示原因，用户只看到任务“停了”。这里用
+      // `failureReason`（或事件流 kFailed.message）兜底；有 run_stop 卡时
+      // 由卡片展示原因，不重复画失败消息。
+      final failureText = result.failureReason ?? _lastFailureMessage;
+      if (!wasCancelled &&
+          _runStop == null &&
+          failureText != null &&
+          failureText.trim().isNotEmpty) {
+        _reportRunFailure(humanizeRunFailure(failureText), origin);
+      }
     } on AgentBridgeException catch (e) {
       if (!mounted) return;
-      _reportRunFailure(e.message, origin);
+      _reportRunFailure(humanizeRunFailure(e.message), origin);
     } catch (e) {
       if (!mounted) return;
-      _reportRunFailure('$e', origin);
+      _reportRunFailure(humanizeRunFailure('$e'), origin);
     } finally {
       // ★★ 收尾必须**无条件**执行 ★★
       //
@@ -4845,6 +5242,9 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 它**不往 `_messages` 里插任何东西**，因此不会污染当前会话，
   /// 同时又让用户知道"刚才那次是失败的"。
   void _reportRunFailure(String message, _RunOrigin origin) {
+    // ★ V0.4 T0（2026-11-02）：所有非用户主动中断统一人话化 —— 原始 400
+    //   JSON / provider 长错误不能直接糊到会话流；但**原因本身绝不吞掉**。
+    final human = humanizeRunFailure(message);
     // ★ 与结果渲染用**同一套**判据（2026-10-11）
     //
     // 必须是 `_isViewingRun` 而不是"上下文代号变没变" ——
@@ -4855,15 +5255,15 @@ class _ChatScreenState extends State<ChatScreen> {
     if (stillHere) {
       // 没切走 —— 照旧内联显示（这是用户最需要看到失败的地方）
       setState(() {
-        _error = message;
+        _error = human;
         _messages
-            .add(HAssistantMessage(id: _nextId(), text: '运行失败：$message'));
+            .add(HAssistantMessage(id: _nextId(), text: '运行失败：$human'));
       });
       return;
     }
 
     // 已切走 —— 用 SnackBar，**不碰** _messages / _error
-    showIosToast(context, '上一个会话的运行失败：$message');
+    showIosToast(context, '上一个会话的运行失败：$human');
     _logDroppedRun(origin);
   }
 
@@ -4913,6 +5313,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _eventSub = null;
     _openSessionSub?.cancel();
     _openSessionSub = null;
+    _workspaceAddedSub?.cancel();
+    _workspaceAddedSub = null;
     // ★★ 16ms 帧定时器**必须**在这里取消 ★★
     //
     // `Timer.periodic` 不受 widget 生命周期管理：不取消的话，离开页面后
@@ -4986,6 +5388,10 @@ class _ChatScreenState extends State<ChatScreen> {
         onSelectSession: _selectSession,
         onNewSession: _newSession,
         onOpenSettings: _openSettings,
+        // ★ 技能 / MCP / 自动化入口（2026-11-02 用户裁定：放抽屉，不放设置页）
+        onOpenAutomation: _openAutomation,
+        onOpenSkills: _openSkills,
+        onOpenMcp: _openMcp,
         onAddWorkspace: _pickWorkspace,
         // ★ 内置「应用工作区」—— 与"选文件夹"并列的第二入口（2026-10-17）。
         //   两个入口互不兜底：一个选用户自己的项目，一个进能构建的内置目录。
@@ -5151,21 +5557,31 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: Stack(
               children: [
                 Positioned.fill(
-                  child: _messages.isEmpty
-                      ? _emptyState(h)
-                      // ★ `ListView.builder` = **惰性构建**：视口外的条目根本
-                      //   不会被创建。逐字场景下这很重要 —— 一轮可能生成几百个
-                      //   步骤片段，全部构建会让滚动直接掉帧（`docs/25` §7 第 1 条）。
-                      : ListView.builder(
-                          controller: _scroll,
-                          padding: const EdgeInsets.fromLTRB(
-                              HSpace.lg, HSpace.lg, HSpace.lg, HSpace.sm),
-                          // ★ 2026-10-23：不再直接遍历 `_messages` —— 中间插了一层
-                          //   **折叠**（连续工具行合并成一行，用户要求见 `_displayRows`）。
-                          itemCount: _displayRows.length,
-                          itemBuilder: (_, i) =>
-                              _buildDisplayRow(_displayRows[i], h),
-                        ),
+                  // ★ T0-2（2026-10-31）：长会话只加载了尾部 ⇒ 列表顶部要有
+                  //   「更早消息未加载」入口。横幅是**列表上方的固定条**
+                  //   （不随滚动离开视口）：用户上滑看历史时仍能看到"上面还有"。
+                  child: Column(
+                    children: [
+                      if (_historyHasEarlier) _earlierMessagesBanner(h),
+                      Expanded(
+                        child: _messages.isEmpty
+                            ? _emptyState(h)
+                            // ★ `ListView.builder` = **惰性构建**：视口外的条目根本
+                            //   不会被创建。逐字场景下这很重要 —— 一轮可能生成几百个
+                            //   步骤片段，全部构建会让滚动直接掉帧（`docs/25` §7 第 1 条）。
+                            : ListView.builder(
+                                controller: _scroll,
+                                padding: const EdgeInsets.fromLTRB(
+                                    HSpace.lg, HSpace.lg, HSpace.lg, HSpace.sm),
+                                // ★ 2026-10-23：不再直接遍历 `_messages` —— 中间插了一层
+                                //   **折叠**（连续工具行合并成一行，用户要求见 `_displayRows`）。
+                                itemCount: _displayRows.length,
+                                itemBuilder: (_, i) =>
+                                    _buildDisplayRow(_displayRows[i], h),
+                              ),
+                      ),
+                    ],
+                  ),
                 ),
                 // ---- 排队管理入口（2026-10-23 用户报「排队不能编辑」）----
                 //   排队条由 `InputBar` 渲染（本屏不能改那个文件），
@@ -5223,11 +5639,18 @@ class _ChatScreenState extends State<ChatScreen> {
                           collapsed: _planCollapsed,
                           onToggle: () => setState(() {
                             _planCollapsed = !_planCollapsed;
-                            // 用户点岛 = 想看计划 ⇒ 取消自动隐藏/收起，
-                            // 保持到下一轮或切会话（本实现选"保持"）。
-                            _planUserInspecting = true;
-                            _planFadingOut = false;
-                            _cancelPlanTimers();
+                            // 点岛 = 用户在看 ⇒ 作废"10 秒后自动收起"，别再动它。
+                            _planAutoCollapseTimer?.cancel();
+                            _planAutoCollapseTimer = null;
+                            // ★ 2026-10-30 P0（T1-3）：只有「已完成后 4 秒窗口内」
+                            //   这一次点击才允许取消自动隐藏（保持到下一轮/切会话）。
+                            //   运行中点岛只是展开/收起 —— 不许再把"看过一眼"
+                            //   变成永久常驻（旧实现就是这么挡住完成态消失的）。
+                            if (_planHideWindowOpen) {
+                              _planUserInspecting = true;
+                              _planFadingOut = false;
+                              _cancelPlanTimers();
+                            }
                           }),
                           reachedGoal: _planReachedGoal,
                           closedReason: _planClosedReason,
@@ -5250,6 +5673,13 @@ class _ChatScreenState extends State<ChatScreen> {
               h: h,
               summary: _pendingAsk!.summary,
               onTap: _reopenPendingAsk,
+            ),
+          // ★ V0.4（#1）：任务被中断卡（原因 + 已用/上限 + 继续按钮）
+          if (_runStop != null)
+            RunStopBanner(
+              info: _runStop!,
+              onContinue: () => unawaited(_continueRun()),
+              onDismiss: () => setState(() => _runStop = null),
             ),
           InputBar(
             // ★ 输入可用性按【当前会话】判，不是全局 `_busy`（2026-10-11 修 t14）
@@ -5348,6 +5778,9 @@ class _ChatScreenState extends State<ChatScreen> {
             // ★ 后端列表（用户要求：模型可以点击选择其他模型）
             providers: widget.settings.value.providers,
             activeProviderId: widget.settings.value.activeProviderId,
+            // ★ 2026-10-31（T2-6）：用户没显式点选时 active 是 null，但胶囊
+            //   显示的是 effectiveProvider —— 传下去抽屉才能标出「当前」。
+            currentProviderId: widget.settings.value.effectiveProvider?.id,
             onProviderSelected: (id) =>
                 unawaited(widget.settings.setActiveProvider(id)),
             // ★ 点进中转站的模型目录（2026-10-14）——
@@ -5712,6 +6145,34 @@ class _ChatScreenState extends State<ChatScreen> {
     unawaited(_showAskDialog(context, p.questions, p.fallbackText));
   }
 
+  // ---- ★ V0.4 续跑（#1，2026-11-02）----
+
+  /// 收到 `run_stopped`：显示中断卡；自动续跑模式下满 3 轮弹确认。
+  Future<void> _onRunStopped(AgentEvent e) async {
+    final info = RunStopInfo.fromEvent(e);
+    if (info == null || !mounted) return;
+    setState(() => _runStop = info);
+    // 自动续跑由 backend 固定跑满 3 轮；到上限后只显示中断卡，
+    // 由用户点「继续」明确同意再消耗 token —— 不再弹自动确认。
+  }
+
+  /// 「继续」：当前会话 + 工作区仍在 ⇒ 以一条**可见的用户消息**“继续未完成的任务”
+  /// 发起下一轮（手动续跑；自动续跑由 executor 内部 continuation 负责，不伪造用户消息）。
+  Future<void> _continueRun() async {
+    if (!mounted) return;
+    if (_activeSessionId == null) {
+      showIosToast(context, '当前还没有可续跑的会话记录');
+      return;
+    }
+    if (_activeWorkspace == null) {
+      showIosToast(context, '请先选择一个工作区再继续');
+      return;
+    }
+    await _runAgent('继续未完成的任务');
+  }
+
+  /// 续跑模式：**固定自动 3 轮**（2026-11-02 用户裁定，不开放设置）。
+
   /// **权限档位变更**（2026-10-29 第 5 条 P1）。
   ///
   /// ## 为什么要专门一个方法
@@ -5924,9 +6385,13 @@ class _ChatScreenState extends State<ChatScreen> {
                   itemCount: p.modelCatalog.length,
                   itemBuilder: (_, i) {
                     final id = p.modelCatalog[i];
-                    final isCurrent =
-                        p.id == widget.settings.value.activeProviderId &&
-                            id == p.model;
+                    // ★ T2-6（2026-10-31）：判"当前"与设置页/输入框胶囊**同一口径**
+                    //   —— 用户没显式点过 provider 时 `activeProviderId` 是 null，
+                    //   而 `effectiveProvider` 已自动选中一个（models/settings.dart
+                    //   :733-749）⇒ 旧判据会让目录里一条 ✓ 都没有。不要在这里
+                    //   重算选择顺序：直接用 effectiveProvider。
+                    final current = widget.settings.value.effectiveProvider;
+                    final isCurrent = p.id == current?.id && id == p.model;
                     return InkWell(
                       onTap: () => Navigator.of(sheetCtx).pop(id),
                       child: Padding(
@@ -5957,6 +6422,54 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     if (picked == null) return;
     await widget.settings.setProviderModel(providerId, picked);
+  }
+
+  /// **「更早消息未加载」横幅**（T0-2，2026-10-31）。
+  ///
+  /// 长会话（> 通道 1MB 文本上限）只加载了最近一段 —— 用户必须**看得见**
+  /// "上面还有"，否则会以为记录丢了（旧实现那句 1MB 提示还被画成了模型气泡）。
+  ///
+  /// ⚠️ 翻页走 `SessionStore` 直连（`AgentBridge` 尚未转发 limit/offset，
+  /// 已移交后端线）：见 [ _loadEarlierMessages ] 的注释。
+  Widget _earlierMessagesBanner(Hue h) {
+    final loading = _historyLoadingEarlier;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(HSpace.lg, HSpace.sm, HSpace.lg, 0),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: loading ? null : () => unawaited(_loadEarlierMessages()),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: h.surfaceAlt,
+            borderRadius: BorderRadius.circular(HRadius.pill),
+          ),
+          child: loading
+              ? Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CupertinoActivityIndicator(
+                          radius: 6, color: h.textFaint),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '正在加载更早消息…',
+                      style: TextStyle(fontSize: 12, color: h.textDim),
+                    ),
+                  ],
+                )
+              : Text(
+                  '加载更早消息',
+                  style: TextStyle(fontSize: 12, color: h.textDim),
+                ),
+        ),
+      ),
+    );
   }
 
   /// 空态 —— 区分「没工作区」与「有工作区没会话」
@@ -6469,6 +6982,21 @@ class RestoredPlan {
   final String? closedReason;
 }
 
+/// 从**完整行序列**恢复历史计划：只认最后一条 `role:"plan"` 行。
+///
+/// T1-3（2026-10-31）：同一场 run 的 JSONL 常留多帧（如 4/5 未完成 →
+/// 5/5 reachedGoal:true）。旧实现逐行恢复，完成行返回 null 时只 continue，
+/// 结果把更早的 4/5 留了下来 ⇒ 切会话/重启后旧进度岛复活。这里显式取
+/// **最后一条**；没有 plan 行也返回 null（调用方清空旧状态）。
+RestoredPlan? restoredPlanFromRows(List<Map<String, dynamic>> rows) {
+  Map<String, dynamic>? lastPlanRow;
+  for (final row in rows) {
+    if ((row['role'] as String?) == 'plan') lastPlanRow = row;
+  }
+  if (lastPlanRow == null) return null;
+  return restoredPlanFromRow(lastPlanRow);
+}
+
 /// 把会话 JSONL 里的 `role:"plan"` 行解析成"能不能恢复灵动岛"。
 ///
 /// 生产路径就是它（`_toMessages` 恢复历史时调用）—— 测试直接喂真实行形状：
@@ -6535,6 +7063,86 @@ bool shouldRestorePlanIsland({
   if (total <= 0) return false;
   if (reachedGoal == true) return false;
   return terminal < total;
+}
+
+/// **从会话 JSONL 行恢复"本会话累计用量"**（T1-4，2026-10-31）。
+///
+/// 用户报的现象：切会话 / 杀进程重开之后，顶栏命中率与用量抽屉变回「—」——
+/// 因为 `_usageBySession` 只在 run 收尾时写内存，而重放历史时 `role:"usage"`
+/// 行被直接跳过。现在 `local_agent` 每次 run 收尾都会追加一条
+/// `role:"session_usage"` 累计汇总行（T1-5），这里把它读回来。
+///
+/// ## 两条来源，**互斥**（绝不叠加 —— 否则同一批 token 记两遍）
+///
+/// 1. **汇总行**（`role:"session_usage"`）：取**最后一条**（写方保证"最后一行 =
+///    最新累计"）。文件里出现汇总行 ⇒ 直接返回它，**不再**扫 assistant/usage 行。
+/// 2. **旧会话（没有汇总行）**：用已落盘的 `assistant` 行（每次 run 的**最后
+///    一轮** usage）与失败 run 的 `role:"usage"` 记账行做降级累计。旧行不是整场
+///    run 的累计 —— 这是**降级口径**：宁可少算，也不重复、不编。
+///
+/// 返回 `null` = 没有任何可用数据（UI 显示「—」，**不画 0%**）。
+///
+/// ## 字段口径（对齐 `models/session_usage.dart`）
+///
+/// · 汇总行的 `cached` **缺省/非数值 = 从没上报过缓存**（不是 0）⇒ 记 0 个
+///   "已上报轮次"，输入放进未上报桶 ⇒ `hitRate == null`（UI「—」）；
+/// · 有 `cached` ⇒ `cachedTokens = cached`、`reportedPromptTokens = prompt`：
+///   汇总行的 `prompt` 是"有 usage 帧的轮次"的整段输入，正好是加权命中率分母；
+/// · `steadyHitRate` 原样透传（缺省 = null，不编）；
+/// · 汇总行没有 `steps` / 模型用时 / 任务总耗时 ⇒ 保持 0（UI 显示「—」）——
+///   这些数在汇总行里不存在，**不拿别的字段顶替**。
+SessionUsage? sessionUsageFromRows(List<Map<String, dynamic>> rows) {
+  int asInt(Object? v) => v is num ? v.toInt() : 0;
+
+  // ---- 1. 汇总行优先（取最后一条）----
+  for (var i = rows.length - 1; i >= 0; i--) {
+    final row = rows[i];
+    if (row['role'] != 'session_usage') continue;
+    // `cached` 缺键 / 非数值 = 从没上报过缓存 ⇒ 不参与命中率（不当 0）。
+    final cachedReported = row['cached'] is num;
+    final turns = asInt(row['turns']);
+    final prompt = asInt(row['prompt']);
+    final steady = row['steadyHitRate'];
+    return SessionUsage(
+      runs: asInt(row['runs']),
+      turns: turns,
+      reportedTurns: cachedReported ? asInt(row['reportedTurns']) : 0,
+      unreportedTurns: cachedReported ? asInt(row['unreportedTurns']) : turns,
+      cachedTokens: cachedReported ? asInt(row['cached']) : 0,
+      reportedPromptTokens: cachedReported ? prompt : 0,
+      unreportedPromptTokens: cachedReported ? 0 : prompt,
+      outputTokens: asInt(row['out']),
+      steadyHitRate:
+          steady is num && steady.isFinite ? steady.toDouble() : null,
+    );
+  }
+
+  // ---- 2. 旧会话降级累计：assistant / usage 记账行 ----
+  var acc = SessionUsage.empty;
+  var found = false;
+  for (final row in rows) {
+    final role = row['role'];
+    if (role != 'assistant' && role != 'usage') continue;
+    // 只认带真实用量字段的行：老 assistant 行没写 cached/prompt/out 时
+    // **不能**当成"0 缓存 0 输入"（那是编数据）。
+    final hasUsage = row.containsKey('cached') ||
+        row.containsKey('prompt') ||
+        row.containsKey('out');
+    if (!hasUsage) continue;
+    final cached = row['cached'];
+    final turn = SessionUsage.ofTurn(
+      // null/缺键 ⇒ 未上报（ofTurn 放进 unreported 桶，不参与命中率）。
+      cachedTokens: cached is num ? cached.toInt() : null,
+      promptTokens: asInt(row['prompt']),
+      outputTokens: asInt(row['out']),
+      // 旧行的 `ms` 是整场 run 的墙钟，不是逐轮"模型用时" —— 不混口径。
+      wallMs: 0,
+    );
+    // 旧数据只能按"一行 ≈ 一次 run"近似 runs（assistant/usage 行每次 run 一条）。
+    acc = acc.add(turn.copyRuns(1));
+    found = true;
+  }
+  return found ? acc : null;
 }
 
 List<HAttachment> attachmentsFromRow(Object? raw, String messageId) {
@@ -6650,6 +7258,20 @@ class _Hint extends StatelessWidget {  const _Hint({
 
 /// **默认空态**（2026-10-26，用户发 TRAE 首页截图定版）：
 ///
+/// **V0.4 定位文案**（2026-11-02，对应 #6）：主叙事是"任意代码项目"，
+/// Android/APK 只是能力之一。抽成公开常量便于测试钉住（不再写死在私有类里）。
+const String kWelcomeGreeting =
+    '今天想做些什么？\n任意代码项目都能交给我';
+
+/// 首屏建议：覆盖 看项目 / 写脚本 / 搭工具 / 修 bug / 写文档，并保留一条 Android 示例。
+const List<(IconData, String)> kWelcomeSuggestions = <(IconData, String)>[
+  (CupertinoIcons.folder_fill, '快速看懂这个项目'),
+  (CupertinoIcons.chevron_left_slash_chevron_right, '帮我写个脚本'),
+  (CupertinoIcons.hammer_fill, '帮我搭个小工具'),
+  (CupertinoIcons.wrench_fill, '帮我修一个 bug'),
+  (CupertinoIcons.doc_text_fill, '帮我写一份文档'),
+  (CupertinoIcons.device_phone_portrait, '做个 Android 小工具'),
+];
 /// 左上顶格两行大字问候，下面一列描边建议胶囊（填充式图标），
 /// 大量留白。点胶囊 = 把文案填进输入框由用户补全/发送，不自动发。
 class _WelcomeState extends StatelessWidget {
@@ -6658,13 +7280,7 @@ class _WelcomeState extends StatelessWidget {
   final Hue h;
   final ValueChanged<String> onSuggest;
 
-  static const _suggestions = <(IconData, String)>[
-    (CupertinoIcons.folder_fill, '快速看懂这个项目'),
-    (CupertinoIcons.chevron_left_slash_chevron_right, '帮我写个脚本'),
-    (CupertinoIcons.hammer_fill, '帮我搭个小工具'),
-    (CupertinoIcons.lightbulb_fill, '碰撞一下灵感'),
-    (CupertinoIcons.doc_text_fill, '帮我整理一份文档'),
-  ];
+  static const _suggestions = kWelcomeSuggestions;
 
   @override
   Widget build(BuildContext context) {
@@ -6682,7 +7298,7 @@ class _WelcomeState extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '今天想做些什么？\n找我，我都可以帮你！',
+                  kWelcomeGreeting,
             style: TextStyle(
               fontSize: 30,
               fontWeight: FontWeight.w700,

@@ -33,6 +33,20 @@
 library;
 
 export 'src/agent/heracles_agent.dart';
+// ★ 进展快照（V0.4，2026-11-02）：长任务"连续 N 轮无进展"的判据来源。
+export 'src/agent/progress_snapshot.dart';
+// ★ 文档读取（V0.4 T1-4）：docx/xlsx/pptx/pdf 文本提取（零依赖 zip 解析）。
+export 'src/agent/document_read.dart';
+// ★ 项目类型识别（V0.4 T1-6，2026-11-02）："任意代码项目"定位的落地（纯函数）。
+export 'src/agent/project_detect.dart';
+// ★ 工具别名（V0.4 T1-4）：名字对齐、旧名不破（纯数据 + 解析函数）。
+export 'src/agent/tools/tool_aliases.dart';
+export 'src/agent/tools/v4_tools.dart';
+// ★ V0.4 T1-5：Skills 扫描 / MCP 配置 / Automation 存储（纯逻辑 + 校验）。
+export 'src/agent/v4_extensions.dart';
+// ★ V0.4 F3（2026-11-02）：MCP 探活 —— 真实 JSON-RPC 握手 + tools/list 发现（纯数据返回）。
+//   放 backend 是为了让 App 只依赖 backend 的公共面，不必直接 import dart_agent_core。
+export 'src/agent/mcp_probe.dart';
 // 会话历史 → 框架消息（2026-10-23）。宿主读会话文件后交给 `run(history:)`。
 export 'src/agent/session_history.dart';
 // 多模态输入边界类型（2026-10-23）。宿主演把图片压成 base64，框架类型不出 backend。

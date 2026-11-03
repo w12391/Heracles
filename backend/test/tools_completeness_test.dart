@@ -217,7 +217,7 @@ void main() {
 // 测试替身
 // ============================================================================
 
-class _FakeWorkspace implements WorkspaceCapability {
+class _FakeWorkspace extends WorkspaceCapability {
   @override
   Future<CapabilityResult> list(String path,
           {bool recursive = false, int maxEntries = 200}) async =>
@@ -295,7 +295,7 @@ class _FakeApk implements ApkCapability {
       const CapabilitySuccess('installed');
 }
 
-class _FakeWeb implements WebCapability {
+class _FakeWeb extends WebCapability {
   @override
   Future<CapabilityResult> fetch(String url, {int maxChars = 50000}) async =>
       const CapabilitySuccess('page');

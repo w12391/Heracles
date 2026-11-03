@@ -135,6 +135,9 @@ class WorkspaceDrawer extends StatefulWidget {
     this.onToggleWorkspace,
     this.onClose,
     this.onOpenWorkspaceFolder,
+    this.onOpenAutomation,
+    this.onOpenSkills,
+    this.onOpenMcp,
     this.onBatchArchiveSessions,
     this.onBatchDeleteSessions,
     this.loading = false,
@@ -157,6 +160,13 @@ class WorkspaceDrawer extends StatefulWidget {
   final void Function(String workspaceId, String sessionId)? onToggleArchive;
   final void Function(String workspaceId)? onToggleWorkspace;
   final VoidCallback? onClose;
+
+  /// **技能 / MCP / 自动化**三个入口（2026-11-02 用户裁定：放主页侧边栏，
+  /// 不放设置页 —— 单一入口，避免两处维护）。回调由宿主（chat_screen）传入，
+  /// 抽屉**不**直接 import screens（避免循环依赖），与 [onOpenSettings] 同模式。
+  final VoidCallback? onOpenAutomation;
+  final VoidCallback? onOpenSkills;
+  final VoidCallback? onOpenMcp;
 
   /// 在系统文件管理里打开该工作区文件夹（工作区菜单里点路径）。
   final void Function(String workspaceId)? onOpenWorkspaceFolder;
@@ -214,6 +224,9 @@ class _WorkspaceDrawerState extends State<WorkspaceDrawer> {
       onToggleArchive: widget.onToggleArchive,
       onToggleWorkspace: widget.onToggleWorkspace,
       onClose: widget.onClose,
+      onOpenAutomation: widget.onOpenAutomation,
+      onOpenSkills: widget.onOpenSkills,
+      onOpenMcp: widget.onOpenMcp,
       onOpenFolder: widget.onOpenWorkspaceFolder,
       loading: widget.loading,
       selecting: _selecting,
@@ -255,6 +268,9 @@ class _WorkspaceDrawerBody extends StatelessWidget {
     this.onToggleArchive,
     this.onToggleWorkspace,
     this.onClose,
+    this.onOpenAutomation,
+    this.onOpenSkills,
+    this.onOpenMcp,
     this.loading = false,
     this.onOpenFolder,
     this.selecting = false,
@@ -272,6 +288,11 @@ class _WorkspaceDrawerBody extends StatelessWidget {
   final void Function(String workspaceId, String sessionId) onSelectSession;
   final void Function(String workspaceId) onNewSession;
   final VoidCallback onOpenSettings;
+
+  /// 技能 / MCP / 自动化入口（同 [WorkspaceDrawer.onOpenAutomation] 等）。
+  final VoidCallback? onOpenAutomation;
+  final VoidCallback? onOpenSkills;
+  final VoidCallback? onOpenMcp;
 
   final ViewOptions viewOptions;
   final void Function(ViewOptions) onViewOptionsChanged;
@@ -333,6 +354,39 @@ class _WorkspaceDrawerBody extends StatelessWidget {
           children: [
             _header(context, h),
             const SizedBox(height: HSpace.sm),
+
+            // ★ 2026-11-02：技能 / MCP / 自动化三个入口放回抽屉（用户裁定：
+            //   放主页侧边栏，不放设置页 —— 单一入口，避免两处维护）。
+            //   ⚠️ 2026-10-19：这里原有「插件 / 自动化任务 / 上下文洞察」三个
+            //   入口，但 onTap 都是空实现被删（假入口比没有入口更伤信任）——
+            //   现在三个页面都有真实通道，按**原位**放回。
+            //   顺序（用户定）：自动化任务 → Skill → MCP 服务器。
+            //   多选模式下隐藏（与工作区区块一致：选会话时不被导航行打扰）。
+            //   回调由宿主传入（与 onOpenSettings 同模式），抽屉不 import screens。
+            if (!selecting &&
+                (onOpenAutomation != null ||
+                    onOpenSkills != null ||
+                    onOpenMcp != null)) ...[
+              _DrawerNavRow(
+                key: const Key('drawer-nav-automation'),
+                icon: AppIcons.clock,
+                label: '自动化任务',
+                onTap: onOpenAutomation,
+              ),
+              _DrawerNavRow(
+                key: const Key('drawer-nav-skills'),
+                icon: AppIcons.think,
+                label: 'Skill',
+                onTap: onOpenSkills,
+              ),
+              _DrawerNavRow(
+                key: const Key('drawer-nav-mcp'),
+                icon: AppIcons.globe,
+                label: 'MCP 服务器',
+                onTap: onOpenMcp,
+              ),
+              const SizedBox(height: HSpace.sm),
+            ],
 
             // ⚠️ 2026-10-19：这里原有「插件 / 自动化任务 / 上下文洞察」三个入口，
             //   但它们的 `onTap` 都是空实现 —— 界面上承诺了、点了没反应。
@@ -668,7 +722,6 @@ class _WorkspaceDrawerBody extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _bwSheetHandle(h),
               const SizedBox(height: 8),
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
@@ -761,9 +814,14 @@ class _WorkspaceDrawerBody extends StatelessWidget {
       );
 
   Widget _empty(Hue h) => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(HSpace.xl),
-          child: Column(
+        // ★ 2026-11-02：包一层滚动 —— 空态内容是**固定高度**，而抽屉里
+        //   新增了三条导航行后，body 的可用高度被压矮；矮窗口（测试默认
+        //   600 高 / 小屏横屏）下固定内容会垂直溢出 45px。滚动兜底，
+        //   内容在多矮的容器里都完整可读。
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.all(HSpace.xl),
+            child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(CupertinoIcons.folder_badge_plus,
@@ -812,6 +870,7 @@ class _WorkspaceDrawerBody extends StatelessWidget {
               ],
             ],
           ),
+        ),
         ),
       );
 
@@ -930,7 +989,6 @@ class _WorkspaceDrawerBody extends StatelessWidget {
                     // 边框的选项卡（与审批模式/单选抽屉同款），
                     // 选中 = 主文本色边框（浅色下黑边框）；旧版
                     // 「纯文字行 + 右侧对勾」与抓手一起补齐。
-                    _bwSheetHandle(h),
                     _sheetGroupLabel(h, '分组方式'),
                     _optionCard(h, '按工作区',
                         draft.grouping == SessionGrouping.byWorkspace, () {
@@ -1058,7 +1116,6 @@ void _sessionMenu(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            _bwSheetHandle(h),
             const SizedBox(height: 8),
             _bwMenuRow(
               h,
@@ -1108,17 +1165,6 @@ void _sessionMenu(
 }
 
 /// 抽屉抓手（与 bw 系列抽屉一致的样式）
-Widget _bwSheetHandle(Hue h) => Center(
-      child: Container(
-        width: 36,
-        height: 4,
-        decoration: BoxDecoration(
-          color: h.border,
-          borderRadius: BorderRadius.circular(999),
-        ),
-      ),
-    );
-
 /// 统一抽屉菜单行 = 边框动作卡（BwActionCard，2026-10-29 用户
 /// 定版）：灰边框、无单选圆圈，按下时边框变主文本色；
 /// [danger] = 图标与文字一起语义红（删除类）。
@@ -1507,7 +1553,6 @@ class _AddWorkspaceMenu extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                _bwSheetHandle(h),
                 const SizedBox(height: 8),
                 _bwMenuRow(
                   h,
@@ -1779,7 +1824,6 @@ class _WorkspaceGroup extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              _bwSheetHandle(h),
               const SizedBox(height: 8),
               // 路径行：点按 → 在系统文件管理里打开这个文件夹
               // （宿主 fs.openFolder；打不开时外层 toast 如实提示）
@@ -2051,6 +2095,54 @@ class _SessionRow extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// **导航行（技能 / MCP / 自动化）**——2026-11-02 回抽屉的三行。
+///
+/// 样式复用抽屉底部「设置」行的规格：浅灰圆角方砖图标 + 正色文字
+/// （视觉归组，一眼看出与设置行同级）。回调可空：宿主没接就不画这一行
+/// （假入口比没有入口更伤信任 —— 2026-10-19 的教训）。
+class _DrawerNavRow extends StatelessWidget {
+  const _DrawerNavRow({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+
+  /// 空实现不画（本行只在宿主接了回调时才出现）。
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final h = Hue.of(context);
+    if (onTap == null) return const SizedBox.shrink();
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(
+            horizontal: HSpace.xl, vertical: HSpace.lg),
+        child: Row(
+          children: [
+            Container(
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                color: h.surface,
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Icon(icon, size: 17, color: h.text),
+            ),
+            const SizedBox(width: HSpace.md),
+            Text(label, style: TextStyle(fontSize: 15, color: h.text)),
+          ],
         ),
       ),
     );

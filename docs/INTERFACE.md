@@ -75,6 +75,7 @@
   - **plan 行只增字段** `reachedGoal`/`closedReason`：每次写 plan 行时若已知道收尾信息就带上；**收尾时追加一条最终 plan 行** `{"role":"plan","steps":[…],"reachedGoal":true|false,"closedReason":"…","ts":…}`；旧行缺这两个字段 ⇒ 按 `null`（未知）处理；**不重写旧行、append-only 不变**。
   - 顺序（实测钉死）：**`plan_closed` 事件先于 `finished`/`failed`**；**最终 plan 行在 assistant 行之前**（与既有 plan 行位置一致，重放时计划块在回答上方）。
   - 状态：实现中；真机（5 步任务第 2 步停止 → 重开会话看"已中断"+原因）**未验证**。
+- **2026-10-31 新增（自动推进，只增行为）**：计划不再只在模型 `write_todos` 时更新 —— 每个**工作类工具成功执行后**自动推进一格并推一帧 `plan_updated`（当前 `in_progress` → `completed`，下一个 `pending` → `in_progress`；无 `in_progress` 时首个 `pending` 变 `in_progress` 且本步不标 done）。约束：非执行类工具（`write_todos`/`ask_user`/`save_memory`/`activate_skills`）不推进；**失败工具不推进、绝不把失败步骤标 done**；**每步只自动推进一次**；模型随后 `write_todos` 覆盖时**以模型为准**（重置自动记账）；`plan_closed` 语义不变（全部 `done`/`cancelled` 才 `reachedGoal=true`）。提示词与 `write_todos` 描述已强化"每完成一步立刻更新，不要攒到最后"。
 
 ### N5 模型与思考等级 —— ✅ 已满足（2026-10-25 补 `reasoningLevelsEffective`）
 
@@ -389,6 +390,254 @@ class VoicePartial {
 
 > **2026-10-30 真机验收（B1）**：断网首次点麦克风 ⇒ 私有目录幂等解压出 4 文件 + `.complete`（字节与 assets 一致）；`[voice] partial` seq 0→14、chars 0→15、语音期间间隔 **200–300ms**；`isFinal=true` 只在真断句（2 次）与停止收尾（1 次）出现（VAD 静音期重复 final 已修）；停止后文本提交到输入框（截图留档，日志不含正文）。**未验证**：取消（前端无入口，仅单测）、整段 SenseVoice 回退出字（非本轮验收项）、逐字准确度（不承诺）。
 
+### N14 长任务续跑（V0.4 · 契约冻结 2026-11-02 · 后端落码中）
+
+> **前端已并行落 UI**：`widgets/run_stop_banner.dart`（适配层，先读 raw/args）与 `widgets/run_continue_mode_section.dart`（三档设置，prefs `heracles.run.continueMode`）。
+> 本节字段与前端适配层**逐字对齐**；后端强类型字段落地后前端可直接读 `e.reason/e.round/...`（适配层可随后删除）。
+
+#### N14.1 `run_stopped` 事件（`AgentEvent.kRunStopped = 'run_stopped'`）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `reason` | String | 8 值枚举（见下） |
+| `round` | int | 本次停在第几轮（从 1 计） |
+| `maxRounds` | int | 当前策略的轮数上限 |
+| `tokensSpent` | int | 本次 run 已花 token（估算/上报口径与用量一致） |
+| `tokensLimit` | int | token 上限 |
+| `nextEstimate` | int? | 再跑一轮的估算 token（无依据则 null，**不编数**） |
+| `canContinue` | bool | 是否可续（`false` 时 UI 禁用继续） |
+| `changedFiles` | List<String> | 本次 run 改动文件（相对路径，去重；取不到=空列表） |
+| `errorSummary` | String? | 人话错误摘要（**不得是堆栈/内部 id**） |
+| `resumedFromRound` | int? | 本次是从第几轮 checkpoint 恢复的（非恢复=null） |
+
+`reason` 枚举（只增）：`max_rounds`（轮数到上限）· `token_budget`（token 到上限）· `no_progress`（连续 2 轮无进展）· `provider_timeout`（模型侧超时）· `network`（网络不可恢复）· `process_killed`（进程被杀后恢复发现）· `context_compress_failed`（压缩失败且无法继续）· `user_cancel`（用户取消）。
+
+#### N14.2 续跑策略 `ContinuePolicy`
+
+| 值 | 语义 |
+|---|---|
+| `off`（前端默认） | 跑一轮就停；停时发 `run_stopped`（`canContinue=false`） |
+| `ask` | 每轮结束都发 `run_stopped`（`canContinue=true`），等用户确认再跑下一轮 |
+| `auto` | 自动续跑，**默认 `maxRounds=3`**；到第 3 轮仍未完成 ⇒ 不自动续，发 `run_stopped(canContinue=true + nextEstimate)` 等确认 |
+
+- `tokenLimit` 默认 **2_000_000**（`ContractAgent.runTokenLimit`）；**轮数与 token 谁先到停谁**（先触发者决定 `reason`）。
+- 策略由宿主传入（前端 prefs `heracles.run.continueMode` 映射到 `RunOptions.continuePolicy`），后端不读 UI。
+
+#### N14.3 `run_checkpoint` 行（append-only）
+
+每轮结束追加一行（**只增行类型**，不改旧行）：
+
+```json
+{"role":"run_checkpoint","sessionId":"s…","runId":"r…","round":2,"plan":[…],
+ "toolCalls":7,"tokens":123456,"lastMessage":"…","progressSnapshot":{…},"ts":1793…}
+```
+
+- 恢复时从**最后一条** `run_checkpoint` 继续：已落盘的消息不重复追加、不伪造用户消息（续跑用内部 continuation 状态/系统注入说明，UI 只显示"自动续跑第 N 轮"）。
+- 旧文件无该行 ⇒ 正常从头跑，不假装有 checkpoint。
+
+#### N14.4 无进展检测 `ProgressSnapshot`
+
+`{filesHash, changedFiles[], testsPassed?, testsTotal?, errorSignature?}`：
+- 文件树 hash + 改动文件列表；
+- 测试通过数**仅**从可解析输出（pytest / jest / go test / gradle）提取；解析不到 ⇒ **不写数**（只用文件+错误）；
+- 错误签名 = 相同错误文本/堆栈 hash；
+- **连续 2 轮无进展 ⇒ 停 `no_progress`**，摘要给 UI（`errorSummary`/`changedFiles`）。
+
+#### N14.5 超时与恢复
+
+- 网络/流式超时：**分类重试**（backoff，最多 N 次，`ContractAgent.*Retry*` 常量），可恢复 ⇒ 续跑；不可恢复 ⇒ `run_stopped(provider_timeout|network)`。
+- 进程被杀：下次启动从最后 checkpoint 恢复，并如实提示（`process_killed` 语义，`canContinue=true`）。
+- 状态：⚠️ 后端落码中；真机（长任务 3 轮续跑/锁屏续跑）**未验证**。
+
+### N15 V0.4 扩展面（2026-11-02 · 只增契约）
+
+> 本节登记 T0-2/3 + T1-4/5/6 的**前端可见契约**；实现进度与"未接"项逐条如实标注。
+
+#### N15.1 后台保活（Android）
+
+- 前台服务 `AgentChatService`：`START_STICKY`、`onTaskRemoved`、`PARTIAL_WAKE_LOCK`（2h 超时兜底、结束必释放）、
+  Manifest `android:stopWithTask="false"`；通知显示**真实步骤文案** + 点击回跳。
+- `heracles/command` 只增 4 方法：`requestIgnoreBatteryOptimizations`（返回 bool，只引导不改设置）/
+  `autostartGuide`（`{brand, path}`，**不自动跳转**）/ `processKilled`（`{killed, killedAt}`）/
+  `consumeProcessKilled`。Dart 同名封装（通道缺失安全降级）。
+
+#### N15.2 沙箱环境管理（L1 only）
+
+- `SandboxProfile{isolationTier, network, mirrors}`：`isolationTier ∈ process|container|vm`，**只实现 process**；
+  container/vm 明确 `tierImplemented=false` + `tierNote`（不假实现）。
+- `network`：`whitelistOnly`（默认 true）、`allowAllOutbound`（**显式开关**）、`riskLevel(low|high)`、
+  `riskNote`（**必须含"策略级，非硬隔离"**）、`hosts`（默认白名单 + 可追加企业源）、`proxy`。
+- Dart：`SandboxService.envProfile()/installEnv()/uninstallEnv()/detectProjectEnv()`；返回
+  `SandboxEnvProfile` / `SandboxEnvInstallResult`（失败带人话；`verifiedVersion` 拿不到=null）。
+- ⚠️ sandbox-channel 方法未实现 ⇒ 调用明确失败（不返回假数据）。
+
+#### N15.3 工具面
+
+- `web_search`（未配置搜索服务 ⇒ **明确报错不编结果**；结果必须带来源 URL）；
+  `notify_user`（权限被拒 ⇒ **如实失败**）。
+- 别名：`Read/Write/Edit/Glob/Grep/Exec/WebFetch/WebSearch/Memory/Ask/Notify` 等可解析到正式工具名；
+  **旧正式名全部仍可用**；未知名字 ⇒ 不猜（报未知工具）。
+
+#### N15.4 Skills / MCP / Automation（后端能力，宿主执行层未接）
+
+- Skills：`SKILL.md`（front-matter：`name`/`description` + 正文）解析；批量扫描逐条报错；启停/卸载。
+- MCP：服务器配置 `{name, transport(stdio|http), command, url, args, env, enabled}`；校验拒绝非法配置与
+  **密钥进 env**；CRUD。
+- Automation：任务 `{id,title,prompt,schedule(interval|cron),intervalMinutes,cron,enabled,runHistory}`；
+  校验必填；运行历史最近 20 条、只记真实结果；~~`schedulerImplemented=false`（不假调度）~~
+  → **❌ 该行已过期，2026-11-02 更正**：宿主已用 **AlarmManager** 真调度（`AutomationScheduler`），
+  但**执行**仍需 App 在前台 ⇒ 真实口径是 `schedulerImplemented=true` +
+  `executionRequiresAppForeground=true`；消费闭环见 **N16.3**。cron 仍未实现（只支持 interval，不假装支持）。
+
+#### N15.5 定位（任意代码项目）
+
+- 系统提示：**能完成任意代码项目**（Node/Python/Go/Rust/Java/Flutter/APK；**APK 只是能力之一**）；
+  先认项目类型、按生态选构建/测试命令、缺工具链如实说。
+- `detectProject(fileNames)` → `{kind, label, manifest, buildCommands, testCommands, notes}`；
+  Flutter 优先于 Android；**认不出 ⇒ unknown 且命令为空**（不编造）。
+- `defaultSystemPrompt(caps, {project})`：不传 project ⇒ 提示词字节与旧版一致。
+
+#### N15.6 文件夹选择器的结果找回（T0 修复 · 2026-11-02 · 只增不改）
+
+> 背景：SAF 选择器在前台时 Activity 可能被系统回收重建 ⇒ 旧实现把 pending 回调
+> 挂在 **Activity 实例**上，重建后结果**没有收件人**被丢弃；Dart 侧 `await` 又没有
+> 超时 ⇒ 用户看到"选好文件夹返回就黑屏/卡住"。
+
+`heracles/command` **只增 1 个可选入参 + 1 个方法 + 1 条反向推送**（不新开通道、
+不改已有语义、旧客户端照常工作）：
+
+| 项 | 形状 | 说明 |
+|---|---|---|
+| `pickWorkspace`（**入参只增**） | 入参 `{requestId?: String}` | Dart 每次调用生成；Kotlin 用它在**进程级**登记表里配对，Activity 重建后仍能对上 |
+| `consumePickWorkspaceResult`（**新方法**） | 入参 `{requestId: String}` → 出参 `Map?` | 取回该次请求**已产出但没送达**的结果；取过即作废。无结果 / 过期（5 min）/ requestId 不匹配 ⇒ `null`（**不匹配不会吃掉别人已有的结果**） |
+| `workspaceAdded`（**新推送**，Kotlin → Dart） | `{path, name}` | 宿主登记成功后推给**当前活着的引擎**。重建后 Dart 是全新 isolate，它启动时读的列表里没有新目录 —— 收到这条就重载 |
+
+- Kotlin 侧状态全部在**进程级单例** `PickRequestRegistry`（不在 `Activity` 上）；
+  `takeSink()` 取走即清空 ⇒ 同一请求绝不交付两遍。
+- ★ 收尾落库跑在 **进程级协程域**（不是 Activity 的 `scope`）：Activity 在
+  `onDestroy` 里 cancel 了自己的 scope，用它等于"结果永远登记不上"。
+- Dart 侧超时 `ContractFolderPicker.timeoutSeconds = 45`，**只计 App 在前台的时间**
+  （选择器盖住我们时停表 —— 真机实测用户可挑 70 s，按墙钟计会误报"结果已丢失"）；超时后**先回收**再报错
+  （避免把"其实选成功了"误报成失败）；回收仍无果才抛
+  `ContractFolderPicker.timeoutMessage`，UI 走「可操作失败」抽屉（重试 / 默认工作区）。
+- 取消仍回 `null`（**旧契约不变**）；受限/网盘仍回 `{ok:false, error, reasonCode?, suggest?}`。
+- ⚠️ 旧宿主没有 `consumePickWorkspaceResult` ⇒ Dart 侧 `MissingPluginException` 降级为超时提示，不抛未捕获异常。
+- **真机验证（2026-11-02，Redmi K60 / Android 17 / 1080×2400）**：
+  - 正常路径 ✔ 选 `.../tests`、`.../fixtures`、`.../magic-resume-2.0.12` 三个目录，均登记成功并出现在侧边栏；
+    logcat `onActivityResult req=18502 res=-1 data=true`（`res=-1` = RESULT_OK，data 非空）。
+  - 长时间挑选 ✔ 在选择器里停留 **70 s / 88 s** 后返回，**不再误报**"结果已丢失"（第一次真机跑出的缺陷，已按"只计前台时间"修正）。
+  - 取消 ✔ 返回系统上一级到根再退出 ⇒ 回 `null`，界面一行提示 + 重试，不卡死。
+  - 进程被杀 ✔ `am force-stop` 后冷启动：无黑屏（debug 包冷启动约 2–3 s 白屏属正常），
+    并恢复上次会话（SharedPreferences `last_session_v1`）。
+  - 首帧看门狗 ✔ logcat 出现 `watchdog: 首帧正常（返回前台后已渲染），不动作`（未误重建）。
+  - ⚠️ **未覆盖**：Activity 被系统回收重建（本机 MIUI 忽略 `settings put global always_finish_activities`，
+    设了也不重建 ⇒ 该分支只有单测覆盖，**真机未取证**）。
+- 首帧看门狗：`onPostResume` 后 2.5 s 若 `FlutterView.hasRenderedFirstFrame()` 仍为 false
+  且**本次进程曾渲染过**、**没有选择请求在飞**、**30 s 内没重建过** ⇒ `recreate()` 一次并打
+  `HeraclesAct` 日志说明原因（不用硬编码 sleep 掩盖）。
+
+### N16 V0.4 收口：Skills / MCP / Automation / Search 通道（2026-11-02 · 只增契约）
+
+> 本节是 F1–F4 的**前端可见契约**。所有方法都加在既有 `heracles/command` 上（不新开通道）。
+> **只增不改**：旧方法形状不变。
+> 统一返回：成功 `{ok: true, ...}`；失败 `{ok: false, error: <人话>, code: <E_...>}`。
+> ⚠️ 通道**不抛 PlatformException**（与 `heracles/command` 既有风格一致），Dart 侧一律判 `ok`。
+
+#### N16.1 Skills（F1）
+
+`heracles/command` 只增 4 方法（宿主只做**文件系统**，解析/校验/合并都在 Dart）：
+
+| 方法 | 入参 | 返回 |
+|---|---|---|
+| `skillsList` | `{workspace: String}` | `{ok, entries: [{path, raw}], enabled: {name: bool}}` |
+| `skillsSetEnabled` | `{name: String, enabled: bool}` | `{ok}` |
+| `skillsInstall` | `{workspace: String, source: String}` | `{ok, installed: [{path, raw}], errors: [String]}` |
+| `skillsRemove` | `{workspace: String, name: String, path?: String}` | `{ok, removed: bool}` |
+
+- 扫描路径：`<workspace>/.heracles/skills/**/SKILL.md`（递归，最多 4 层；超过 512 KB 的单个文件不读，报 `errors`）。
+- **启停状态唯一存在宿主**（`SharedPreferences` 的 `name → bool`，缺省 `true`）。`builtin` 与 `user` 共用这一张表。
+- `skillsInstall` 来源校验：`https://` URL 或**绝对路径**（`/` 开头）；拒绝 `http://` 明文、拒绝 `..` 穿越、拒绝落到工作区之外；
+  目标目录 `<workspace>/.heracles/skills/<slug>/SKILL.md`，同名已存在 ⇒ 覆盖并如实返回。
+- **非法 `SKILL.md` 逐条报错**：宿主只搬字节不判语义；Dart 用 backend `parseSkillMd` 逐条解析，
+  失败项进 `errors`（形如 `<path>: <原因>`），**不整体失败**。
+- `skillsRemove`：优先用 `path` 定位（更准）；只给 `name` 时由 Dart 从已解析清单里取路径再传。
+
+**Dart 服务**（`app/lib/services/skills_service.dart`）：
+
+- `listSkills()` → `SkillsSnapshot{builtin: List<SkillView>, user: List<SkillView>, errors: List<String>}`
+- `SkillView{name, description, source('builtin'|'user'), enabled, path}`
+- `setSkillEnabled(name, enabled)` / `installSkill(source)` / `removeSkill(name)`
+- 内置清单一律来自 backend `builtinSkillEntries()`（**唯一来源**，不在 App 里硬编码）。
+
+#### N16.2 MCP（F3）
+
+`heracles/command` 只增 3 方法：
+
+| 方法 | 入参 | 返回 |
+|---|---|---|
+| `mcpList` | — | `{ok, servers: [{name, transport, command, url, args, env, enabled}]}` |
+| `mcpSave` | `{server: {name, transport, command, url, args, env, enabled}}` | `{ok}` / `{ok:false, error, code}` |
+| `mcpDelete` | `{name: String}` | `{ok, deleted: bool}` |
+
+- 持久化：`SharedPreferences("heracles_mcp")` 的单个 JSON 数组键 `servers`。
+- **密钥不进 env**：宿主二次拦截（键名含 `KEY`/`TOKEN`/`SECRET`/`PASSWORD` ⇒ `E_MCP_SECRET_IN_ENV`）；
+  第一道是 backend `validateMcpServer`（Dart 在保存前调用）。
+- 日志脱敏：宿主**不打印** `env` 与 `url` 的 query 段；错误信息里只出现 `name` 与状态码。
+- **`testMcpConnection` 不在通道上**：由 Dart 服务层真连，宿主不重复实现一份"假连接"。
+  - `status ∈ not_configured | unsupported | failed | connected`；`connected` 必须带 `tools` 工具数。
+  - `stdio` 传输在 Android 上**不支持**（没有可执行子进程环境）⇒ `status:'unsupported'` + 人话原因，**不假装连上**。
+  - ★ **偏离登记（2026-11-02，用户已确认口径）**：原始任务书写的是"`heracles/command` 只增
+    `testMcpConnection`"；实际落码为 **backend `probeMcpConnection(cfg)`（`backend/lib/src/agent/mcp_probe.dart`）**
+    —— **连接测试属于后端探活，不是通道方法**。理由：宿主没有 MCP 客户端，在 Kotlin 手搓
+    JSON-RPC 握手只能得到一个"看起来连上了"的假结果；backend 可以用真实本地
+    `HttpServer` 做测试（`backend/test/mcp_probe_test.dart`，含 SSE / 分页 / 脱敏）。
+    通道上**没有** `testMcpConnection` 方法，调用它会得到"未知方法"。
+
+**Dart 服务**（`app/lib/services/mcp_service.dart`）：
+`listServers()` / `saveServer(cfg)` / `deleteServer(name)` / `testConnection(name)` → `McpTestResult{status, tools, error, latencyMs}`。
+
+#### N16.3 Automation 消费闭环（F2）
+
+**通道不变**（`automationSave` / `automationLoad` / `automationConsumePending` 既有）；改的是**语义与任务 JSON 的只增字段**：
+
+- 任务 JSON 只增三个键（旧读者忽略即可）：
+  `lastRun: {ts, ok, error?, durationMs}` · `nextRunAt: int(ms)` · `lastError: String?`；
+  `runHistory: [{ts, ok, error?, durationMs}]`（**最近 20 条**，只记真实结果）。
+- **到点 → 真执行**：App 启动 / 回前台消费 pending ⇒ 用真实 run 执行 `task.prompt`
+  （走审批门禁 / 预算 / 沙箱，与手动发送**同一条路径**）。
+- **幂等**：pending 由宿主原子取走（取即清）；Dart 侧再加两道闸 ——
+  内存 `_running` 集合（同进程不并发同任务）+ `lastRun.ts` 距上次 < 间隔一半 ⇒ 判为重复触发跳过。
+- ⚠️ **UI 文案必须同步改**：旧文案"到点只发通知，不会自动执行"在 F2 落地后**不再成立**。
+  新文案口径：**"到点后在你下次打开/回到 App 时自动执行；App 未打开时只提醒"**。
+  （文案在 `screens/`，**移交前端**；后端不越界改。）
+
+#### N16.4 搜索服务 endpoint（F4）
+
+**纯 Dart，无通道方法**（`flutter_secure_storage`）：
+
+- `SearchConfigService`：`read()` → `{endpoint, hasKey}`；`save(endpoint, {key})`；`clear()`；`masked()` → `{endpoint, keyMasked}`。
+- 校验：`endpoint` 必须 `http://`/`https://` 且能 `Uri.parse`；否则**拒绝保存**并回人话原因。
+- 注入：`buildDeviceCapabilities(searchEndpoint: ...)` → `DeviceWebCapability.searchEndpoint`。
+  ⚠️ **未配置** ⇒ `web_search` 明确失败（保持 N15.3 语义），**不编造结果**。
+
+> ★ **2026-11-02 晚 · 免鉴权收敛（用户裁定，覆盖上面第 3 条的旧说法）**
+>
+> `DeviceWebCapability` **没有自定义请求头的位置** ⇒ 存了 Key 也发不出去。
+> 本轮裁定**明确不支持鉴权**，不留半截：
+>
+> 1. `save(endpoint, {key})`：key 非空 ⇒ **整笔拒绝**（`E_SEARCH_KEY_UNSUPPORTED` +
+>    人话「当前版本仅支持免鉴权搜索服务…」），**endpoint 也不写** —— 绝不出现
+>    "已保存却不生效"的状态。先校验 endpoint、再谈 Key（地址错了先报地址）。
+> 2. 上一版本遗留的 Key：`read()` / `masked()` 读到即**迁移删除**，并如实回
+>    `hasKey:false` / `keyMasked:''`。发不出去的凭据不许躺在存储里装样子。
+> 3. 工具错误文案统一为「当前版本仅支持免鉴权搜索服务…」（`web_search` 未配置时）。
+> 4. 契约常量：`ContractSearch.keyHeaderSupported = false`（下一轮翻这个开关）。
+>
+> **⬜ 待实现（下一轮任务，不许写成已支持）**：给 `WebCapability` /
+> `DeviceWebCapability` 增加**自定义请求头（headers / apiKey）缝** +
+> 装配层从 secure storage 注入。在那之前，需要鉴权的搜索服务**不可用**，
+> UI 不得提供 Key 输入框（或置灰并说明"当前版本仅支持免鉴权搜索服务"）。
+
 ## 5. 流式与渲染约定 —— ✅ 无异议
 
 后端保持原始粒度不节流；`approval_required`/`context_updated`/`plan_updated` 三类新事件已按 §6.1 登记到本文。
@@ -398,6 +647,7 @@ class VoicePartial {
 - 新事件类型已登记（approval_required / context_updated / plan_updated；approval_request 与 plan_created 保留在 knownTypes 供旧读者，后端不再发送）；
 - 事件字段只增（callId/workspaceInside/breakdown/limit/limitSource/planStepsDetailed）；`.jsonl` 只增行类型与字段（tool_call/plan/compact 行 + tool 行的 id 字段；**2026-10-29 新增**：step 行可带 prompt/cached/out（cached 为 null 不写键），新增 `role:"approval"` 与 `role:"ask"` 结果行，字段见 §N12.10 与 `接口.md` §7.2；旧值 `'allow'|'allow_always'` 仍接受但落盘统一 `once/always/deny`；**D6 已拍板**：tool 行只增 `surface`/`exitCode`/`command`（取不到就不写键，回放由前端接））；
 - 契约常量以 `contract.dart` 为唯一来源 ✅（同目录另有 `接口.md` 记录后端→前端的实现面，与本文互补：本文是**前端提出的契约**，`接口.md` 是**后端的实现清单**）。
+- **2026-10-31 只增项**：① `plan_updated` 由**自动推进**额外触发（见 N4；模型 `write_todos` 覆盖优先）；② 长会话读取：`loadMessages` 返回结构只增 `truncatedAtHead`/`hasEarlier`，默认改读**尾部 N 行**（见 `接口.md` §9.4）；③ 新增 JSONL 行类型 `role:"session_usage"`（见 `接口.md` §9.5，只增不吃旧行）；④ 语音模型状态/卸载 API 只增（`voiceEnabled`/`E_VOICE_UNINSTALLED`/`deleteAllVoiceModels`/`installVoiceModels`，见 `接口.md` §9.6）。
 
 ## 7. 待确认 —— 已关账（前端 2026-10-25 全部接受）
 
@@ -530,3 +780,92 @@ flutter analyze                                   # 期望 No issues found!
 ```
 
 真机侧由后端负责（`--dart-define=SANDBOX_SELFTEST=true` 的守卫自检，release 不带）。
+---
+
+## N17 沙箱优先（2026-11-02 用户裁定 · 只增登记）
+
+> **裁定**：产品目的**不是构建 APK、不是安卓专属功能**。用户拿智能体**改代码、处理工作、改文档**；
+> **沙箱是主战场和工作台**；宿主 shell 可以很弱，只负责把沙箱产物交付给用户（力所能及、能用则用）；
+> 没有现成工具就自写脚本（python 等）在沙箱跑。构建 APK 只是众多能力之一。
+> 来源：2026-11-02 用户裁定（工作记录 `.docs/前端对接清单.md` §14，本机私有文件）。
+
+对**提示词与工具描述**的影响（后端落码，wire 不变）：
+
+1. `defaultSystemPrompt` 新增**主战场段**（`backend/lib/src/prompt/system_prompt.dart`）：
+   - 沙箱就绪的宿主：改代码/跑脚本/处理文档**默认在沙箱完成**；没有现成工具 ⇒ 先 `apk add` 装，
+     装不了**自己写脚本（python 等）在沙箱跑，不放弃任务**；宿主 shell 只做
+     **交付产物**（放可见/可分享位置、导出）与**力所能及的系统查询**，能不用则不用、
+     不确定先说清；**构建 APK 仅在用户明确要 APK 时才走那条路**。
+   - ⚠️ **按 `hasSandbox` 分叉**：没接沙箱的宿主（CLI/测试替身）给**如实的短版**
+     （"本环境没有沙箱执行面…"），**不说"默认在沙箱里完成"** —— 沿用 P1-③ 的
+     "说事实不说反话"纪律。
+2. `run_shell_command` 的 description 开头加**用途定位**：沙箱优先（工作台执行面）；
+   宿主侧仅用于交付与力所能及的查询。**工具名、参数形状、事件流都不变** ⇒ wire 不变，
+   **不触发真 Key 门禁**。
+3. ⚠️ **基线提示词是本次有意的破坏性变更**：~~"不传 project ⇒ 提示词与旧版逐字节一致"~~
+   （N15.5 旧句已过期）。产品口径变更优先于缓存前缀稳定；缓存多失效一次是可接受代价。
+   门禁改为：**含沙箱优先关键句、不含 APK 中心表述**（`system_prompt_positioning_test` ⑤–⑧）。
+
+### 验收
+
+- `cd backend && dart analyze`（干净）+ `dart test`（全绿）
+- 快照断言：⑤ 主战场关键句（主战场/自己写脚本/把沙箱产物交付给用户/力所能及的系统查询/能不用则不用/apk add）
+  ⑥ 仅用户明确要 APK + 不含 APK 中心表述 ⑦ 缺工具链指引两种宿主都在 ⑧ 无沙箱宿主 ⇒ 短版如实
+- 变异一组：删掉主战场段（改回旧句）⇒ ⑤⑥⑦ 红；还原后 sha256 一致（提交信息里报）
+- **未真机验证**（本机无设备/无真 Key）：新提示词对真实模型行为的实际影响未验证
+
+---
+
+## N18 保活引导后端配套（2026-11-02 · 只增契约）
+
+> `heracles/command` 只增 2 方法：`keepaliveStatus` 与 `oemGuide`（既有
+> `requestIgnoreBatteryOptimizations` / `autostartGuide` / `processKilled` 全部不变）。
+> 统一口径：**查不到就 false/null + note，不编数据**。
+
+### N18.1 keepaliveStatus（聚合真实状态，只读）
+
+| 入参 | 返回 |
+|---|---|
+| — | `{ok, foregroundServiceRunning: bool, batteryIgnored: bool, batteryNote: String?, autostart: {brand, path}?}` |
+
+- `foregroundServiceRunning`：**Kotlin 侧真实查**（`AgentChatService.running` 静态位）；
+  查不到/异常 ⇒ `false` + `batteryNote` 说明原因，**不编"在跑"**。
+- `batteryIgnored`：`PowerManager.isIgnoringBatteryOptimizations(packageName)` **真实值**；
+  读取异常 ⇒ `false` + `batteryNote`，不编。
+- `batteryNote`：**口径差异必须写明** —— MIUI 的省电策略「无限制」**≠** 系统电池优化白名单
+  （真机实测：MIUI 显示"无限制"但 `isIgnoringBatteryOptimizations=false`）。
+  小米/Redmi 且已忽略时附这条提醒，防止用户以为"开了无限制就等于白名单"。
+- `autostart`：当前品牌的自启动路径（同 `autostartGuide`；认不出的品牌给**通用兜底文案**，
+  **不编具体路径**）。
+- **Dart 侧**：`AgentBridge.keepaliveStatus()` → `KeepaliveStatus?`；**字段可空** ——
+  宿主**没给的字段保持 null**（缺的不编）；`MissingPluginException`/`PlatformException` ⇒ `null`
+  （整个状态不可用，UI 显示通用说明，**不编任何一项**）。
+
+### N18.2 oemGuide(kind)（MIUI 保活三件套 + 各品牌路径，只给数据不跳转）
+
+| 入参 | 返回 |
+|---|---|
+| `{kind: "autostart" \| "backgroundPopup" \| "lockScreenShow"}` | `{ok, brand, path}` / `{ok:false, error}` |
+
+- 三类：**自启动 / 后台弹出界面 / 锁屏显示**（MIUI 保活三件套）。
+- 每类给**品牌路径文案**；查不到的品牌给**通用兜底文案**（明说"本品牌没有公开统一入口"），
+  **不编路径**。
+- 未知 `kind`：宿主返回 `{ok:false, error}`；**Dart 侧先行拒绝**（`ArgumentError`，
+  且**不调通道**）。
+- 既有 `autostartGuide` **保留**（`oemGuide('autostart')` 的薄封装），旧调用方不变。
+- **契约红线不变**：只引导，**不自动跳转**。
+
+### N18.3 requestIgnoreBatteryOptimizations 三态（已在 `3cfe0af` 落码，此处补登记）
+
+- `null` = 当前版本不支持（`MissingPluginException`，**不引导重试**）；
+  `false` = 没生效（`PlatformException`/用户取消，可再试）；`true` = 已确认。
+- 旧宿主上不许把"通道不存在"吞成 false —— 那会让用户反复重试一个不存在的方法。
+
+### 验收
+
+- `cd backend && dart analyze` 干净 + `dart test` 全绿
+- Dart 契约测试：keepaliveStatus 三态（全有/部分缺/全缺，**缺的不编**）+
+  MissingPlugin 区分；oemGuide 三类 + 未知 kind 拒绝（且通道零调用）
+- 改 Kotlin ⇒ `flutter build apk --debug --target-platform android-arm64` 真编过
+  （三件套判成功：`√ Built` + 产物 mtime + sha256）
+- **未真机验证**：`AgentChatService.running` 实际值、MIUI 口径 note 的真机表现（无设备）
