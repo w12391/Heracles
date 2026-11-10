@@ -59,7 +59,7 @@ import 'package:heracles_backend/heracles_backend.dart';
 import '../models/attachment.dart';
 import '../models/settings.dart';
 import 'agent_bridge.dart'
-    show AgentEvent, AgentRunResult, AgentTurn, ToolState;
+    show AgentBridge, AgentEvent, AgentRunResult, AgentTurn, ToolState;
 import 'device_capabilities.dart';
 import 'diff_stats.dart';
 import 'global_memory.dart' show runMemoryMigrationOnce;
@@ -246,7 +246,8 @@ RunStopDecision? decideRunStop({
   // 已完成：不需要续跑。
   if (taskDone) return null;
   // token 预算：**硬预算优先**（"谁先到停谁"里 token 是不可协商的那条线）。
-  if (tokensSpent >= tokenLimit) {
+  // ★ 2026-11-05：`tokenLimit == 0` = 不限（用户要跑几十亿 token 的会话）
+  if (tokenLimit > 0 && tokensSpent >= tokenLimit) {
     return RunStopDecision(
       reason: 'token_budget',
       canContinue: policy != ContinuePolicy.off,
@@ -1006,6 +1007,10 @@ class LocalAgentExecutor {
       //   provider 无关概念 → 框架 extra → OpenAI 轨的 reasoning_effort。
       //   auto 不下发（旧行为）；Anthropic/Responses 轨暂不生效（框架不读）。
       reasoningEffort: settings.reasoningLevel.reasoningEffort,
+      // ★ 2026-11-05：单轮输出上限可配（上游对同一模型的限额不同；填 0 = 用契约默认）
+      maxOutputTokens: provider.maxOutputTokens > 0
+          ? provider.maxOutputTokens
+          : ContractModel.maxOutputTokens,
       provider: switch (provider.protocol) {
         ProviderProtocol.anthropic => BackendProvider.anthropic,
         ProviderProtocol.openaiResponses => BackendProvider.openAiResponses,
@@ -1253,6 +1258,17 @@ class LocalAgentExecutor {
           options: RunOptions(
             maxTurns: maxTurns,
             maxToolCalls: ContractAgent.maxToolCalls,
+            // ★ 2026-11-06：压缩阈值可由 `/autocompact <0.05-0.95>` 覆盖（存 prefs）。
+            // ★ 2026-11-06：阈值来自 /autocompact（桥里缓存的静态值，同步读）。
+            compaction: CompactionConfig(
+              autoCompactThreshold: AgentBridge.autoCompactOverride ??
+                  ContractCompaction.autoCompactThreshold,
+              // ★ 上一次真实输入 token：新一轮开始时 backend 拿不到 usage，
+              //   没有它压缩会被字符估算骗过去（真机 122% 却不压）。
+              // 只认当前会话的值：别的会话的体积绝不许顶进来
+              knownPromptTokens:
+                  AgentBridge.knownPromptTokensForActiveSession,
+            ),
             // ★ 三作用域记忆（2026-10-29）：结构化传入，排序/预算/渲染在 backend。
             //   非空即优先（即使三段都空也不回落旧 memoryNote —— 旧字段已 @Deprecated）。
             memory: memoryContext,

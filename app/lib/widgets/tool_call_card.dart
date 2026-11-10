@@ -1,12 +1,14 @@
 import 'dart:convert';
 import 'dart:ui' show ImageFilter;
 
+import 'package:flutter/cupertino.dart' show showCupertinoModalPopup;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../models/message.dart';
 import '../models/settings.dart';
 import '../theme/app_theme.dart';
+import 'bw_approval.dart';
 import 'v04_tool_card.dart';
 import '../theme/cupertino_kit.dart';
 
@@ -225,7 +227,10 @@ class ToolGroupRow extends StatelessWidget {
     final summary = toolGroupSummary(tools);
     final tone = failed ? HColors.errorOn(h.dark) : h.text;
 
-    return InkWell(
+    // 2026-11-08（用户反馈）：工具卡片上横滑会误开侧边栏。
+    // 卡片自己认领横向拖动（什么都不做）：内层识别器在竞技场里胜出，
+    // 抽屉的边缘拖动就抢不走这次滑动 —— 抽屉仍可从边缘正常拉出。
+    return _ClaimHorizontalDrag(child: InkWell(
       onTap: onToggle,
       borderRadius: BorderRadius.circular(HRadius.sm),
       child: ConstrainedBox(
@@ -277,7 +282,7 @@ class ToolGroupRow extends StatelessWidget {
           ),
         ),
       ),
-    );
+    ));
   }
 }
 /// ```
@@ -560,7 +565,12 @@ int? commandExitCodeOf(HToolCall call) {
     if (m != null) return int.tryParse(m.group(1)!);
   }
 
-  // ③ 拿不到就不显示 —— 不猜、不编造
+  // ③ 成功的命令调用 ⇒ 退出码必然是 0（不是编造：命令没报错就是 0）。
+  //   真机 2026-11-09：成功的 `run_shell_command` 没有结构化 exitCode，
+  //   于是标头只剩「复制」——用户直接问「退出码呢？」。
+  if (call.status == ToolStatus.success) return 0;
+
+  // ④ 失败但解析不出具体码 ⇒ 交给调用方显示「未知」，绝不编一个数字
   return null;
 }
 
@@ -775,7 +785,17 @@ class ToolCallCard extends StatefulWidget {
     super.key,
     required this.call,
     this.stepDetail = StepDetail.standard,
+    this.forceExpanded = false,
+    this.hideFloatingActions = false,
   });
+
+  /// 隐藏卡片自带的「退出码 + 复制」悬浮药丸（2026-11-09）。
+  ///
+  /// 抽屉里标题行已经有这两个操作，卡片再画一遍就重复了（真机截图为证）。
+  final bool hideFloatingActions;
+
+  /// 强制展开明细（抽屉里用：抽屉本身只承载"明细"，不需要再点一次）。
+  final bool forceExpanded;
 
   final HToolCall call;
 
@@ -809,8 +829,8 @@ class _ToolCallCardState extends State<ToolCallCard> {
   ///
   /// 为什么用 `late` 而不是在 `build` 里改状态：`build` 里改 state 会触发布局期
   /// setState（Flutter 会警告）。初始化只发生一次，正是我们要的"默认值"。
-  late bool _expanded =
-      widget.stepDetail.showArgs && commandSurfaceOf(widget.call) == null;
+  late final bool _expanded = widget.forceExpanded ||
+      (widget.stepDetail.showArgs && commandSurfaceOf(widget.call) == null);
 
   /// **改动详情**是否展开（2026-10-21，BUG-4）。
   ///
@@ -886,7 +906,9 @@ class _ToolCallCardState extends State<ToolCallCard> {
         children: [
           // ---- 头部：折叠箭头 + 状态图标 + 工具名 + 状态词 + 元信息 ----
           InkWell(
-            onTap: hasBody ? () => setState(() => _expanded = !_expanded) : null,
+            // ★ 2026-11-08（用户要求）：点卡片**呼出上拉抽屉**看明细，
+            //   不再在原地展开 —— 内联展开会把对话流顶长，还容易和侧栏手势打架。
+            onTap: hasBody ? () => _openDetailSheet(h, hasBody) : null,
             borderRadius: BorderRadius.circular(HRadius.sm),
             child: ConstrainedBox(
               constraints: const BoxConstraints(minHeight: kMinTapTarget),
@@ -1072,6 +1094,57 @@ class _ToolCallCardState extends State<ToolCallCard> {
   // 命令卡（双层）—— 见文件上方 `CommandSurface` 处的定调注释。
   // ============================================================
 
+  /// **明细抽屉**（2026-11-08 用户要求）。
+  ///
+  /// 复用 `BwSheetShell`（与审批/用量抽屉同一套抓手与圆角），
+  /// `allowDrag: false` ⇒ **不可拉高**；内容超高在抽屉内部滚动。
+  /// 抽屉里放的是**同一张卡片**（`forceExpanded: true`），样式零改动。
+  void _openDetailSheet(Hue h, bool hasBody) {
+    showCupertinoModalPopup<void>(
+      context: context,
+      builder: (ctx) => BwSheetShell(
+        onDismissRequest: () => Navigator.of(ctx).pop(),
+        allowDrag: false,
+        // ★ 2026-11-08 真机修复：`showCupertinoModalPopup` 路由里**没有 Material 祖先**，
+        //   卡片内部的 InkWell 会直接抛「No Material widget found」。套一层透明 Material。
+        child: Material(
+          type: MaterialType.transparency,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.sizeOf(ctx).height * 0.62,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                CommandSheetTitle(
+                  title:
+                      '${widget.call.tool} · ${widget.call.status == ToolStatus.failure ? '失败' : (widget.call.status == ToolStatus.running ? '执行中' : '完成')}',
+                  exitCode: commandExitCodeOf(widget.call),
+                  onCopy: () => _copyCommand(widget.call),
+                ),
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.sizeOf(context).height * 0.5,
+                  ),
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                    child: ToolCallCard(
+                      call: widget.call,
+                      stepDetail: widget.stepDetail,
+                      forceExpanded: true,
+                      hideFloatingActions: true,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _commandCard(Hue h, HToolCall call, CommandSurface surface) {
     final running = call.status == ToolStatus.running;
     final exitCode = commandExitCodeOf(call);
@@ -1124,6 +1197,8 @@ class _ToolCallCardState extends State<ToolCallCard> {
             ],
           ),
           // 悬浮工具：退出码 + 复制（不独占一行）
+          // 2026-11-09：抽屉里已在标题行给过这两枚 ⇒ 卡内不再重复画一遍。
+          if (!widget.hideFloatingActions)
           Positioned(
             top: 8,
             right: 10,
@@ -2047,6 +2122,114 @@ class MarkdownLite extends StatelessWidget {
     }
     return RichText(
       text: TextSpan(children: spans, style: base),
+    );
+  }
+}
+/// 认领横向拖动，避免手势被外层「边缘拉抽屉」抢走（2026-11-08 用户反馈）。
+///
+/// 只声明横向拖动识别器、不做任何事：竞技场里内层胜出，抽屉拿不到这次滑动；
+/// 纵向滚动与点按都不受影响（`translucent` 不吞其它手势）。
+class _ClaimHorizontalDrag extends StatelessWidget {
+  const _ClaimHorizontalDrag({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onHorizontalDragStart: (_) {},
+      onHorizontalDragUpdate: (_) {},
+      onHorizontalDragEnd: (_) {},
+      child: child,
+    );
+  }
+}
+/// **工具抽屉的标题行**（2026-11-09 用户要求）。
+///
+/// 右侧固定两枚元素（不随卡内滚动消失）：
+/// · **退出码**：`0` 绿、非 `0` 红（读不出来就不显示）；
+/// · **复制**：黑底白字胶囊。
+///
+/// 单条工具抽屉与分组抽屉共用，保证两处样式一字不差。
+class CommandSheetTitle extends StatelessWidget {
+  const CommandSheetTitle({
+    super.key,
+    required this.title,
+    this.exitCode,
+    this.onCopy,
+  });
+
+  final String title;
+  final int? exitCode;
+  final VoidCallback? onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    final h = Hue.of(context);
+    final ok = exitCode == 0;
+    final codeColor = exitCode == null
+        ? h.textFaint
+        : (ok ? HColors.successOn(h.dark) : HColors.errorOn(h.dark));
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 2, 12, 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              title,
+              style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: h.text),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          // 永远占这一格：拿不到具体值就显示「未知」（灰），不让它整块消失。
+          ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(HRadius.pill),
+                border: Border.all(color: codeColor.withValues(alpha: 0.45)),
+              ),
+              child: Text(
+                exitCode == null ? '退出码 未知' : '退出码 $exitCode',
+                style: TextStyle(
+                  fontFamily: kMonoFontFamily,
+                  fontFamilyFallback: kMonoFallback,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w700,
+                  color: codeColor,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+          if (onCopy != null)
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: onCopy,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  // 黑底白字（用户明确要求）
+                  color: h.text,
+                  borderRadius: BorderRadius.circular(HRadius.pill),
+                ),
+                child: Text(
+                  '复制',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: h.bg,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }

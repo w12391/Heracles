@@ -159,40 +159,41 @@ void main() {
   });
 
   group('触发阈值 —— 按模型窗口比例，不是写死的数', () {
-    test('★★★ 128K 窗口 ⇒ 阈值 102400（= 128000 × 0.80）', () {
+    test('★★★ 128K 窗口 ⇒ 阈值 108800（= 128000 × 0.85）', () {
       final c = compressor(modelWindowTokens: 128000);
-      expect(c.triggerThreshold, 102400);
+      expect(c.triggerThreshold, 108800);
     });
 
-    test('★★★ 80% 是用户明确要求的比例（不是拍的）', () {
-      // 用户原话：「如果上下文达到了 80% 必须先自动压缩，然后继续任务」。
-      expect(ContractCompression.compressAtRatio, 0.80);
+    test('★★★ 85% 是现任强制线的比例（2026-11-04 用户确认从 0.80 上调）', () {
+      // 用户在真机 120% 事故后确认：摘要 60% / 强制重置 85% / 发送硬顶 90%。
+      expect(ContractCompression.compressAtRatio, 0.85);
+      expect(ContractCompression.sendCeilingRatio, 0.90);
     });
 
     test('★★★ 换窗口阈值跟着变（自适应才是这个类存在的理由）', () {
-      expect(compressor(modelWindowTokens: 200000).triggerThreshold, 160000);
-      expect(compressor(modelWindowTokens: 8192).triggerThreshold, 6553,
-          reason: '8192 × 0.8 = 6553.6 ⇒ floor 6553');
+      expect(compressor(modelWindowTokens: 200000).triggerThreshold, 170000);
+      expect(compressor(modelWindowTokens: 8192).triggerThreshold, 6963,
+          reason: '8192 × 0.85 = 6963.2 ⇒ floor 6963');
     });
 
-    test('★★ 阈值向下取整（不能浮点漏成 0.8 个 token）', () {
-      // 10000 × 0.8 = 8000（整数，无余数）
-      expect(compressor(modelWindowTokens: 10000).triggerThreshold, 8000);
-      // 10001 × 0.8 = 8000.8 ⇒ floor ⇒ 8000
-      expect(compressor(modelWindowTokens: 10001).triggerThreshold, 8000);
-      // 10005 × 0.8 = 8004.0（整数）
-      expect(compressor(modelWindowTokens: 10005).triggerThreshold, 8004);
+    test('★★ 阈值向下取整（不能浮点漏成 0.85 个 token）', () {
+      // 10000 × 0.85 = 8500（整数）
+      expect(compressor(modelWindowTokens: 10000).triggerThreshold, 8500);
+      // 10001 × 0.85 = 8500.85 ⇒ floor ⇒ 8500
+      expect(compressor(modelWindowTokens: 10001).triggerThreshold, 8500);
+      // 10005 × 0.85 = 8504.25 ⇒ floor ⇒ 8504
+      expect(compressor(modelWindowTokens: 10005).triggerThreshold, 8504);
     });
 
     test('★★ 默认参数来自契约常量（不是内联字面量）', () {
       final c = compressor();
       expect(c.compressAtRatio, ContractCompression.compressAtRatio);
-      expect(c.compressAtRatio, 0.80);
+      expect(c.compressAtRatio, 0.85);
       expect(c.keepRecentTurns, 6);
     });
   });
 
-  group('窗口 10000 的边界：7999 不压 / 8000 压', () {
+  group('窗口 10000 的边界：micro 线 4000 / 强制线 8500', () {
     /// 造一个估算值恰好约等于 [tokens] token 的 state。
     ///
     /// ## 估算规则（`_estimateTokens`，别猜）
@@ -220,7 +221,7 @@ void main() {
       );
     }
 
-    test('★★★ 7999 token < 阈值 8000 ⇒ 不压（delegate 一次都不调）', () async {
+    test('★★★ 3999 token < micro 线 4000 ⇒ 既不清理也不摘要（一次都不调）', () async {
       final client = _RecordingClient();
       var compressed = 0;
       final c = WindowRatioCompressor(
@@ -230,11 +231,11 @@ void main() {
         onCompressed: (_, __, ___, ____) => compressed++,
       );
 
-      final state = stateWithTokens(7999);
+      final state = stateWithTokens(3999);
       final usage = c.estimateUsage(state);
-      // 正好 7999（汉字 1:1，没有 ceil 误差）
-      expect(usage, 7999, reason: '构造必须精确：实际 $usage');
-      expect(usage, lessThan(8000));
+      // 正好 3999（汉字 1:1，没有 ceil 误差）
+      expect(usage, 3999, reason: '构造必须精确：实际 $usage');
+      expect(usage, lessThan((10000 * ContractCompression.microRatio).floor()));
 
       final before = client.calls;
       await c.compress(state);
@@ -242,7 +243,7 @@ void main() {
       expect(compressed, 0, reason: '没到阈值不许触发压缩事件');
       expect(client.calls, before, reason: '没到阈值连摘要请求都不该发');    });
 
-    test('★★★ 8000 token = 阈值 ⇒ 放行到 delegate', () async {
+    test('★★★ 8500 token = 阈值 ⇒ 放行到摘要', () async {
       final client = _RecordingClient();
       final c = WindowRatioCompressor(
         client: client,
@@ -250,10 +251,10 @@ void main() {
         modelWindowTokens: 10000,
       );
 
-      final state = stateWithTokens(8000);
+      final state = stateWithTokens(8500);
       final usage = c.estimateUsage(state);
-      expect(usage, 8000, reason: '构造必须精确：实际 $usage');
-      expect(c.triggerThreshold, 8000);
+      expect(usage, 8500, reason: '构造必须精确：实际 $usage');
+      expect(c.triggerThreshold, 8500);
       expect(usage, greaterThanOrEqualTo(c.triggerThreshold));
 
       // 放行 ≠ 真的压缩：delegate 内部还有早退条件
@@ -313,148 +314,249 @@ void main() {
   });
 
   // ==========================================================================
-  // 三级压缩（2026-10-24）：micro(40%) / auto(60%) / full(80% 强制)
+  // 单阈值 + 一次性流水线（2026-11-06）
+  //
+  // ⚠️ 本组**替换**了旧的"micro 在 40% 触发"用例：那个行为已被用户删除
+  //（真机实测：每轮在 40% 线上改写历史中段 ⇒ 缓存命中率只有 40%~48%）。
+  // 现在的契约是"**不到 0.85 线一个字节都不动**；到线才在同一个压缩事件里
+  // 跑一次 micro"。断言比旧版更严：旧版只能证明"40% 会动"，新版同时证明
+  // "**40%~85% 之间绝不动**"（这才是缓存命中的命门）。
   // ==========================================================================
-  group('三级 —— 第一级 micro（≥40% 且 <60%）：无 LLM 清理老工具结果', () {
-    /// 造一个估算值落在 [4000, 6000) 的 state：一条大工具结果 + 30 条小消息。
-    ///（消息总数 32 > 保护窗 24 ⇒ 大结果落在保护窗外，micro 才碰得到它。）
-    AgentState stateForMicro({int resultChars = 4500}) => AgentState(
-          sessionId: 's-micro',
+  group('单阈值 —— 85% 以下零副作用，到线才在事件内跑一次 micro', () {
+    /// 造一个"估算落在 [8500 以上] 且中段有一条大工具结果"的 state。
+    ///
+    /// 33 条消息 > 保护窗 24 ⇒ 大结果（index 1）在保护窗外，micro 才碰得到。
+    AgentState stateWithOldBigResult({int fillerTokens = 150}) => AgentState(
+          sessionId: 's-micro-once',
           history: AgentMessageHistory(messages: [
-            UserMessage.text('读文件' * 5), // 10 token
+            UserMessage.text('读文件'), // 3 token
             FunctionExecutionResultMessage(results: [
               FunctionExecutionResult(
-                id: 'c1',
+                id: 'call-1',
                 name: 'read_file',
                 isError: false,
                 arguments: '{"path":"a.txt"}',
-                content: [TextPart('内' * resultChars)], // CJK 1 字 = 1 token
+                content: [TextPart('内' * 4500)], // 4500 token
               ),
             ]),
-            for (var i = 0; i < 30; i++) UserMessage.text('字' * 20),
+            for (var i = 0; i < 31; i++) UserMessage.text('字' * fillerTokens),
           ]),
         );
 
-    test('★★★ 老工具结果被换成占位符，正文一字不动，零 LLM 调用', () async {
+    test('★★★ 40%~85% 之间 ⇒ 历史与字节完全不变、零 LLM 调用、不播事件', () async {
       final client = _RecordingClient();
       var notified = 0;
       final c = WindowRatioCompressor(
         client: client,
         modelConfig: ModelConfig(model: 'stub'),
-        modelWindowTokens: 10000, // micro 线 4000 / auto 线 6000
+        modelWindowTokens: 10000, // 触发线 = 8500
         onCompressed: (_, __, ___, ____) => notified++,
       );
-      final state = stateForMicro();
+      // 3 + 4509 + 31×50 ≈ 6062 个汉字 ⇒ ≈6062 token（> 40% 线 4000，< 85% 线 8500）
+      final state = stateWithOldBigResult(fillerTokens: 50);
       final before = c.estimateUsage(state);
-      expect(before, inExclusiveRange(4000, 6000),
-          reason: '构造必须落在 micro 区间，实际 $before');
+      expect(before, greaterThan((10000 * 0.40).floor()),
+          reason: '构造必须超过旧的 40% 线 —— 否则证明不了"不开小差"');
+      expect(before, lessThan((10000 * 0.85).floor()),
+          reason: '构造必须低于触发线，实际 $before');
+      final beforeMessages = List<LLMMessage>.of(state.history.messages);
+      final beforeBytes = beforeMessages
+          .map((m) => WindowRatioCompressor.estimateMessageTokens(m))
+          .toList();
+
+      await c.compress(state);
+
+      expect(client.calls, 0, reason: '★ 没到线一次模型调用都不许发出');
+      expect(notified, 0, reason: '★ 没到线不许播"压缩了"');
+      expect(state.history.messages.length, beforeMessages.length,
+          reason: '★★ 条数必须一条不差');
+      expect(
+        state.history.messages
+            .map((m) => WindowRatioCompressor.estimateMessageTokens(m))
+            .toList(),
+        beforeBytes,
+        reason: '★★ 逐条 token 必须一模一样 —— 否则前缀缓存这一轮全废',
+      );
+      expect(c.lastCompaction, isNull, reason: '没压缩就不该有事件');
+    });
+
+    test('★★★ 到线 ⇒ micro 在同一事件内跑一次：只清"较旧"的，保留最近 10 条', () async {
+      final client = _RecordingClient();
+      var notified = 0;
+      final c = WindowRatioCompressor(
+        client: client,
+        modelConfig: ModelConfig(model: 'stub'),
+        modelWindowTokens: 10000,
+        onCompressed: (_, __, ___, ____) => notified++,
+      );
+
+      // 20 条白名单工具结果（各 400 token）+ 25 条填充消息 = 65 条：
+      // · 65 - 24（保护窗）= 41 ⇒ 工具结果在索引 2..40，全部落在保护窗外；
+      // · 保留最近 `microKeepRecentToolResults`(10) 条 ⇒ 最旧 10 条被清；
+      // · 估算 ≈ 8000 + 1000 ≈ 9000 ≥ 8500（到线），清完 ≈ 5100（达标即停）。
+      final results = <FunctionExecutionResult>[
+        for (var i = 0; i < 20; i++)
+          FunctionExecutionResult(
+            id: 'call-$i',
+            name: 'read_file',
+            isError: false,
+            arguments: '{"path":"f$i.txt"}',
+            content: <UserContentPart>[TextPart('内' * 400)],
+          ),
+      ];
+      final msgs = <LLMMessage>[UserMessage.text('开始')];
+      for (final r in results) {
+        msgs
+          ..add(ModelMessage(model: 'm', functionCalls: [
+            FunctionCall(id: r.id, name: r.name, arguments: r.arguments),
+          ]))
+          ..add(FunctionExecutionResultMessage(results: [r]));
+      }
+      for (var i = 0; i < 25; i++) {
+        msgs.add(UserMessage.text('字' * 40));
+      }
+      final state =
+          AgentState(sessionId: 's-micro-once', history: AgentMessageHistory(messages: msgs));
+
+      final before = c.estimateUsage(state);
+      expect(before, greaterThanOrEqualTo(c.triggerThreshold),
+          reason: '构造必须到线，实际 $before');
 
       await c.compress(state);
 
       expect(client.calls, 0, reason: '★ micro 是确定性的，一次 LLM 都不该调');
-      expect(notified, 1, reason: '确有清理 ⇒ 要播事件');
-      final results = state.history.messages
+      expect(notified, 1, reason: '确有清理 ⇒ 播一次事件');
+      expect(c.lastCompaction?.layersRun, <CompactionLayer>[CompactionLayer.micro],
+          reason: '只跑阶段 1 就达标（剩下的层不该再动历史）');
+
+      final kept = state.history.messages
           .whereType<FunctionExecutionResultMessage>()
-          .single;
-      final text = results.results.single.content
-          .whereType<TextPart>()
-          .map((p) => p.text)
-          .join();
-      expect(text, contains('microcompact'));
-      expect(text, contains('4500'), reason: '占位符要如实报原大小');
-      expect(c.estimateUsage(state), lessThan(before),
-          reason: 'token 必须真的省下来了');
+          .toList();
+      expect(kept, hasLength(20), reason: 'micro 不删消息，只换内容');
+      for (var i = 0; i < 10; i++) {
+        final text = kept[i].results.single.content
+            .whereType<TextPart>()
+            .map((p) => p.text)
+            .join();
+        expect(text, ContractCompaction.clearedToolResultPlaceholder,
+            reason: '第 $i 条是最旧的 10 条之一，必须被清');
+      }
+      for (var i = 10; i < 20; i++) {
+        final text = kept[i].results.single.content
+            .whereType<TextPart>()
+            .map((p) => p.text)
+            .join();
+        expect(text, '内' * 400,
+            reason: '第 $i 条属于"最近 10 条"，必须原样保留（模型马上要用）');
+      }
+      // 记账：能指回原 id 与原字符数（可追溯，原始内容没被删）
+      expect(c.clearedRefs.length, 10);
+      expect(c.clearedRefs['call-0']?.originalChars, 400);
+      expect(c.clearedRefs['call-0']?.kind, ClearedKind.toolResult);
+      expect(c.clearedRefs.containsKey('call-19'), isFalse,
+          reason: '最近的那条不该有清理记录');
+      expect(c.estimateUsage(state), lessThan(before), reason: 'token 必须真的降了');
+      expect(c.estimateUsage(state), lessThan(c.triggerThreshold),
+          reason: '压完必须低于触发线 —— 否则下一轮立刻又压');
     });
 
-    test('★★ 保护窗内的工具结果绝不清理；小结果也不清理', () async {
+    test('★★ 保护窗内的工具结果绝不清理（模型马上要用）', () async {
       final client = _RecordingClient();
       final c = WindowRatioCompressor(
         client: client,
         modelConfig: ModelConfig(model: 'stub'),
         modelWindowTokens: 10000,
       );
-      // 大结果放最后一条（保护窗内）⇒ micro 无事可做
+      // ⚠️ 窗内必须有 **> microKeepRecentToolResults(10)** 条白名单工具结果，
+      //   否则"保留最近 10 条"会替保护窗兜住，这条断言就测不到保护窗本身。
+      //   这里 12 条工具结果全在最近 24 条里 ⇒ 一条都不许动。
       final state = AgentState(
         sessionId: 's-tail',
         history: AgentMessageHistory(messages: [
-          for (var i = 0; i < 31; i++) UserMessage.text('字' * 20),
-          FunctionExecutionResultMessage(results: [
-            FunctionExecutionResult(
-              id: 'c1',
-              name: 'read_file',
-              isError: false,
-              arguments: '{}',
-              content: [TextPart('内' * 4500)],
-            ),
-          ]),
+          for (var i = 0; i < 20; i++) UserMessage.text('字' * 300),
+          for (var i = 0; i < 12; i++)
+            FunctionExecutionResultMessage(results: [
+              FunctionExecutionResult(
+                id: 'call-$i',
+                name: 'read_file',
+                isError: false,
+                arguments: '{}',
+                content: <UserContentPart>[TextPart('内' * 400)],
+              ),
+            ]),
         ]),
       );
       final before = c.estimateUsage(state);
-      await c.compress(state);
-      expect(c.estimateUsage(state), before, reason: '保护窗内的不许动');
-      expect(client.calls, 0);
-    });
+      expect(before, greaterThanOrEqualTo(8500), reason: '前提：到线');
 
-    test('★★ 40% 以下 ⇒ 什么都不做（能装下就全装）', () async {
-      final client = _RecordingClient();
-      var notified = 0;
-      final c = WindowRatioCompressor(
-        client: client,
-        modelConfig: ModelConfig(model: 'stub'),
-        modelWindowTokens: 100000,
-        onCompressed: (_, __, ___, ____) => notified++,
-      );
-      final state = stateForMicro(); // 5110 token << 40000
       await c.compress(state);
-      expect(notified, 0);
-      expect(client.calls, 0);
+
+      final results = state.history.messages
+          .whereType<FunctionExecutionResultMessage>()
+          .toList();
+      expect(results, hasLength(12));
+      for (final m in results) {
+        expect(_partsTextOfOwner(m), '内' * 400,
+            reason: '★ 保护窗内的工具结果不许清（12 条全都得原样）');
+      }
+      expect(c.clearedRefs, isEmpty, reason: '保护窗内的东西不该有任何清理记录');
     });
   });
 
-  group('三级 —— 第三级 full（摘要失败/不够时，确定性强制重置）', () {
-    test('★★★ 摘要静默失败 + 估算 ≥80% ⇒ 整批丢弃老轮次 + 插如实说明', () async {
-      final client = _RecordingClient();
+  group('兜底 —— 阶段 2 不可用时的确定性强制重置', () {
+    test('★★★ 摘要静默失败 + 估算 ≥85% ⇒ 整批丢弃老轮次 + 插如实说明', () async {
+      // ★ 这段测的是"**摘要失败**时兜底仍成立"。
+      //   2026-11-06 起必须显式关掉 Session Memory：否则阶段 2（纯本地规则）
+      //   就能把这 96 条用户消息收进摘要视图，压根不会调模型 ——
+      //   那是设计意图（省钱），但会让本用例测不到兜底路径。
+      final client = _EmptySummaryClient();
       var notified = 0;
       final c = WindowRatioCompressor(
         client: client,
         modelConfig: ModelConfig(model: 'stub'),
         modelWindowTokens: 10000,
+        compactionConfig: const CompactionConfig(sessionMemoryEnabled: false),
         onCompressed: (_, __, ___, ____) => notified++,
       );
-      // 90 批 × 90 token = 8100 ≥ 8000（强制线）。
-      // 真框架 delegate 因 usages 为空会静默早退 ⇒ 只能靠第三级。
+      // 96 批 × 90 token ≈ 8640 ≥ 8500（触发线 0.85）。
+      // 摘要失败 ⇒ 只能靠确定性兜底。
       final state = AgentState(
         sessionId: 's-full',
         history: AgentMessageHistory(
           messages: [
-            for (var i = 0; i < 90; i++) UserMessage.text('字' * 90),
+            for (var i = 0; i < 96; i++) UserMessage.text('字' * 90),
           ],
         ),
       );
 
       await c.compress(state);
 
+      expect(client.calls, greaterThan(0), reason: '确实发起过摘要调用（只是返回空）');
       expect(state.history.messages.length, 7,
           reason: '说明 1 条 + 最近 6 批');
       final note = state.history.messages.first as UserMessage;
       expect(_text(note), contains('[系统维护]'));
-      expect(_text(note), contains('84'),
+      expect(_text(note), contains('90'),
           reason: '如实报丢弃条数，绝不假装"已摘要"');
-      expect(c.estimateUsage(state), lessThan(8000),
-          reason: '★ 重置后必须低于强制线 —— 这就是"80% 必压缩"的兜底');
-      expect(notified, 1, reason: '第二级没生效不播；第三级生效播一次');
+      expect(c.estimateUsage(state), lessThan(8500),
+          reason: '★ 重置后必须低于触发线 —— 这就是"必压缩"的兜底');
+      expect(notified, greaterThanOrEqualTo(1), reason: '兜底生效必须播报');
+      expect(c.lastCompaction?.failureReason, isNotNull,
+          reason: '摘要失败必须在事件里留原因（不许静默）');
     });
 
     test('★★ 无 user 边界的历史也能重置（切点不拆工具批）', () async {
-      final client = _RecordingClient();
+      // 纯 assistant 历史（长工具链）+ 摘要失败 ⇒ 走 _forceReset 的
+      // "没有批次边界"分支：按条数找切点，再调整到不拆调用/结果。
       final c = WindowRatioCompressor(
-        client: client,
+        client: _EmptySummaryClient(),
         modelConfig: ModelConfig(model: 'stub'),
         modelWindowTokens: 10000,
+        compactionConfig: const CompactionConfig(sessionMemoryEnabled: false),
       );
-      // 纯 assistant 历史（长工具链）：66 号位置放一对调用+结果
+      // 66 号位置放一对调用+结果
       final msgs = <LLMMessage>[
-        for (var i = 0; i < 90; i++)
+        for (var i = 0; i < 96; i++)
           ModelMessage(textOutput: '字' * 90, model: 'm'),
       ];
       msgs[66] = ModelMessage(
@@ -486,7 +588,8 @@ void main() {
         expect(kept[2], isA<FunctionExecutionResultMessage>(),
             reason: '★ 切点不许拆散调用与结果 —— 拆散就是 400');
       }
-      expect(c.estimateUsage(state), lessThan(8000));
+      expect(c.estimateUsage(state), lessThan(8500),
+          reason: '重置后必须低于触发线');
     });
   });
 
@@ -515,22 +618,44 @@ void main() {
       );
       await agent.run('问一句').drain<void>();
       final b = agent.contextBreakdown();
-      // N2 契约：固定 7 键，只许新增不许改名
+      // ★ 2026-11-05 新口径（用户指定按"系统提示词/工具定义/用户消息/注入内容/
+      //   技能注入/工具结果/助手消息"拆）：七类必须是主角，旧键只作兼容别名。
       expect(b.keys, containsAll([
-        'system', 'toolDefs', 'toolResults', 'reasoning', 'assistant', 'user', 'summary',
+        'systemPrompt', 'toolDefs', 'user', 'injected', 'skills',
+        'toolResults', 'assistant',
       ]));
-      expect(b['system']!, greaterThan(0), reason: 'system 提示必有');
-      expect(b['user']!, greaterThan(0), reason: '本轮请求在历史里');
-      expect(b['user']!, greaterThan(0), reason: '本轮请求在历史里');
+      // ★ 2026-11-05：**旧别名 system 已删除**（它会被前端合并成「其他」⇒ 重复计数）
+      expect(b.containsKey('system'), isFalse,
+          reason: 'system 别名会让屏上出现「系统提示词 + 其他」两份，必须不发');
+      expect(b.keys, containsAll(['reasoning', 'summary']));
+
+      expect(b['systemPrompt']!, greaterThan(0), reason: '人设与环境必有');
       expect(b['toolDefs']!, greaterThan(0),
-          reason: '发过请求就有工具面快照（21 个工具定义是常驻开销）');
-      // Σ ≈ 旧三块口径（system + toolDefs + 消息）—— 口径没变，只是拆细了
-      final total = b.values.reduce((a, c) => a + c);
-      expect(total,
+          reason: '发过请求就有工具面快照（常驻开销）');
+      expect(b['user']!, greaterThan(0), reason: '本轮请求在历史里');
+      // 技能注入：本用例没开技能 ⇒ 0（不许凭空编一个数）
+      expect(b['skills'], 0);
+
+      // ① 七类互斥：systemPrompt 只含基础人设，不含注入/技能
+      expect(b['systemPrompt']!, lessThan(
+          WindowRatioCompressor.estimateText(defaultSystemPrompt(const Capabilities())) + 500),
+          reason: 'systemPrompt 若把注入/技能也算进来就是重复计数');
+
+      // ② 七类之和 == 旧口径总账（同一套估算器，±0）
+      final seven = b['systemPrompt']! +
+          b['toolDefs']! +
+          b['user']! +
+          b['injected']! +
+          b['skills']! +
+          b['toolResults']! +
+          b['assistant']!;
+      expect(seven,
           WindowRatioCompressor.estimateMessagesUsage(agent.state!) +
               WindowRatioCompressor.estimateToolDefinitions(agent.state!) +
-              b['system']!,
-          reason: '七键之和必须对得上总账（±0，同一套估算器）');
+              b['systemPrompt']! +
+              b['injected']! +
+              b['skills']!,
+          reason: '七类之和必须对得上总账（拆细≠重复计数）');
     });
   });
 }
@@ -538,6 +663,28 @@ void main() {
 /// 取 UserMessage 的文本（断言用）。
 String _text(UserMessage m) =>
     m.contents.whereType<TextPart>().map((p) => p.text).join();
+
+/// 取单条工具结果消息的文本（断言用）。
+String _partsTextOfOwner(FunctionExecutionResultMessage m) =>
+    m.results.single.content.whereType<TextPart>().map((p) => p.text).join();
+
+/// **摘要一律失败**的 client（返回空文本 ⇒ 结构化摘要判为"没做成"）。
+///
+/// 用途：证明第三级"强制重置"在**摘要失败**时仍然兜底。
+class _EmptySummaryClient extends _RecordingClient {
+  @override
+  Future<ModelMessage> generate(
+    List<LLMMessage> messages, {
+    List<Tool>? tools,
+    ToolChoice? toolChoice,
+    required ModelConfig modelConfig,
+    bool? jsonOutput,
+    dynamic cancelToken,
+  }) async {
+    calls++;
+    return ModelMessage(textOutput: '', model: modelConfig.model);
+  }
+}
 
 /// 记录调用次数的 client 替身 —— **绝不联网**。
 ///

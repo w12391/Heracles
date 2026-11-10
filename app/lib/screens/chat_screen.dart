@@ -49,14 +49,11 @@ import '../widgets/input_bar.dart';
 import '../widgets/message_row.dart';
 import '../widgets/tool_call_card.dart'
     show
+        CommandSheetTitle,
         ToolGroupRow,
+        commandExitCodeOf,
         friendlyToolName,
-        kStepRowArrowGap,
-        kStepRowArrowSize,
-        kStepRowHPad,
-        kStepRowStatusGap,
-        kStepRowStatusSize,
-        kStepRowVPad;
+        kStepRowHPad;
 import '../widgets/workspace_drawer.dart';
 
 /// 会话主屏 —— 默认首屏（`06-UI界面设计.md` §6.1）。
@@ -517,7 +514,6 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 值 = 该组**第一条消息在 `_messages` 里的下标**。
   /// 会话严格 append-only ⇒ 老消息的下标不会变，所以这个 key 在会话内稳定；
   /// 换会话/重载消息时清空（展开态本来就只对当前视图有意义）。
-  final Set<int> _expandedToolGroups = <int>{};
 
   /// 每条回答的时间戳 —— 操作行右侧那个 `14:32`。
   /// 消息模型本身没带时间（`HAssistantMessage` 只有 id/text），
@@ -931,7 +927,14 @@ class _ChatScreenState extends State<ChatScreen> {
             const SizedBox(height: 6),
             TopMetricLine(
               label: '命中',
-              valueText: hit == null ? '—' : '${(hit * 100).round()}%',
+              // ★ 2026-11-08：区分「还没有数据」和「上游压根不上报缓存字段」。
+              //   `—` 太含糊：换了 provider（例如某些中转站不回
+              //   `prompt_tokens_details.cached_tokens`）时，用户会以为命中率坏了。
+              valueText: hit != null
+                  ? '${(hit * 100).round()}%'
+                  : (_usage.unreportedTurns > 0 && _usage.reportedTurns == 0
+                      ? '未上报'
+                      : '—'),
               ratio: hit,
               color: hit == null ? h.textFaint : hitStatusColor(h, hit),
             ),
@@ -1113,6 +1116,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void initState() {
+    // 2026-11-08：冷启动读回「独立发送按钮」开关（默认开）
+    unawaited(AgentBridge.loadSeparateSendButton());
     super.initState();
     // ★ 监听手动滚动 —— 用户上滑即暂停自动滚动（`docs/25` §5.3 第 3 条）
     _scroll.addListener(_onScroll);
@@ -3392,6 +3397,8 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _compressedNotes.add(_ContextCompressedNote(
             anchor: _messages.length,
+            beforeMessages: e.beforeMessages,
+            afterMessages: e.afterMessages,
             beforeTokens: e.beforeTokens,
             afterTokens: e.afterTokens,
           ));
@@ -4771,7 +4778,7 @@ class _ChatScreenState extends State<ChatScreen> {
   ///
   /// 摘要结果以**助手消息**形式插入当前屏幕（不落盘 —— 它不是模型回答，
   /// 落盘会污染重放；真正的持久化是会话尾部的 compact 标记行）。
-  Future<void> _doCompact() async {
+  Future<void> _doCompact({String? focus}) async {
     final ws = _activeWorkspace;
     final sid = _activeSessionId;
     if (ws == null) {
@@ -4794,6 +4801,7 @@ class _ChatScreenState extends State<ChatScreen> {
         workspacePath: ws.path,
         sessionId: sid,
         settings: widget.settings.value,
+        focus: focus,
       );
       if (!mounted) return;
       setState(() {
@@ -4814,8 +4822,49 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _runAgent(String request) async {
     // ★ /compact 手动压缩（2026-10-24，C2 的 P2 欠账）：拦截在**落用户气泡
     //   之前** —— /compact 是命令不是对话内容，不该出现在会话流里。
-    if (request.trim().toLowerCase() == '/compact') {
+    // ★ 2026-11-06 命令层扩展（用户要求）：
+    //   /compact            —— 按阈值语义做一次摘要压缩
+    //   /compact focus on X —— 指定重点（focus 存在时强制走模型摘要）
+    //   /autocompact 0.9    —— 设置自动压缩阈值（0.05~0.95，存 prefs）
+    final cmd = request.trim();
+    final lowerCmd = cmd.toLowerCase();
+    if (lowerCmd == '/compact') {
       await _doCompact();
+      return;
+    }
+    if (lowerCmd.startsWith('/compact focus on ')) {
+      final focus = cmd.substring('/compact focus on '.length).trim();
+      await _doCompact(focus: focus.isEmpty ? null : focus);
+      return;
+    }
+    if (lowerCmd.startsWith('/autocompact')) {
+      final arg = cmd.substring('/autocompact'.length).trim();
+      final v = double.tryParse(arg);
+      final cur = AgentBridge.autoCompactOverride;
+      if (v == null || v <= 0.05 || v >= 0.95) {
+        setState(() {
+          _messages.add(HAssistantMessage(
+            id: _nextId(),
+            text: '用法：/autocompact 0.9（0.05~0.95 之间的小数）。'
+                '${cur == null ? '' : '当前生效值：$cur'}',
+          ));
+        });
+        _followBottomIfNeeded();
+        return;
+      }
+      final ok = await AgentBridge.writeAutoCompactThreshold(v);
+      await AgentBridge.refreshAutoCompactOverride();
+      if (!mounted) return;
+      setState(() {
+        _messages.add(HAssistantMessage(
+          id: _nextId(),
+          text: ok
+              ? '✅ 自动压缩阈值已设为 $v（占用超过窗口 '
+                  '${(v * 100).round()}% 时触发一次压缩）。'
+              : '❌ 阈值没写进去（存储失败），仍是原值。',
+        ));
+      });
+      _followBottomIfNeeded();
       return;
     }
     // ★ V0.4（#1）：新一轮开始 ⇒ 上一轮的中断卡作废（别让旧"被中断"常驻）
@@ -5402,6 +5451,10 @@ class _ChatScreenState extends State<ChatScreen> {
       //
       // **☰ 按钮始终保留** —— 手势是补充，不是唯一入口。
       drawerEnableOpenDragGesture: true,
+      // 2026-11-08 用户反馈：200dp 太宽 —— 在工具卡片上横滑会误开侧边栏。
+      // 收敛到窄边缘：想开抽屉必须从最左侧拉，卡片区域的横滑不再被抢走。
+      // 2026-11-08（用户澄清）：不是一刀切 —— 边缘宽度恢复原值，抽屉仍从左侧大片区域拉出；
+      // 误触改由「工具卡片自己认领横向拖动」解决（tool_call_card 的 _ClaimHorizontalDrag）。
       drawerEdgeDragWidth: 200,
 
       onDrawerChanged: (open) {
@@ -5741,6 +5794,8 @@ class _ChatScreenState extends State<ChatScreen> {
             // 按钮语义也要分清：只有**当前会话**在跑时才是"停止"，
             // 别的会话在跑时显示"等待" —— 否则用户在 B 看到"停止"会以为能停 B 的东西
             stopLabel: _currentSessionRunning,
+            // 2026-11-08：独立发送按钮开关（默认开）—— 开=回车换行，关=回车发送
+            newlineOnEnter: AgentBridge.separateSendButton,
             // ★ 发送：忙时按设置走"排队"或"中断"
             onSend: _onSend,
             // ★ 停止（2026-10-13）—— 只在"当前会话在跑"时被点击
@@ -5921,38 +5976,83 @@ class _ChatScreenState extends State<ChatScreen> {
       case _SingleRow(:final message):
         return _messageRow(message);
       case _ToolGroupRow(:final anchor, :final calls):
-        final expanded = _expandedToolGroups.contains(anchor);
+        // 2026-11-08：不再内联展开 —— 详情走 `_showToolGroupSheet`（上拉抽屉）。
+        // 这里保留 `anchor` 只为分组定位，不再需要 expanded 状态。
+        assert(anchor >= 0);
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            // ★ 2026-11-08（用户要求）：**点击呼出上拉抽屉**看详情，
+            //   不再在下方内联展开 —— 内联展开会把对话流顶得很长，而且
+            //   展开区在列表里滑动容易和侧边栏手势打架。
             ToolGroupRow(
               tools: [for (final c in calls) c.tool],
-              expanded: expanded,
+              expanded: false,
               // 组里只要有一条失败，整行按失败色 —— 合并视图不许把失败藏起来
               failed: calls.any((c) => c.status == ToolStatus.failure),
-              onToggle: () => setState(() {
-                if (expanded) {
-                  _expandedToolGroups.remove(anchor);
-                } else {
-                  _expandedToolGroups.add(anchor);
-                }
-              }),
+              onToggle: () => _showToolGroupSheet(calls),
             ),
-            // 展开后就是**原来的**单条工具行（一点没变），用户能看参数与结果
-            if (expanded) ...[
-              for (final c in calls) _messageRow(c),
-              // 展开态给一条淡淡的收束线，视觉上说明"这组到此为止"
-              Padding(
-                padding: const EdgeInsets.only(
-                    left: kStepRowHPad + kStepRowArrowSize + kStepRowArrowGap),
-                child: Container(height: 1, color: h.border),
-              ),
-            ],
           ],
         );
       case _ContextCompressedRow(:final note):
         return _contextCompressedRow(h, note);
     }
+  }
+
+  /// **工具/命令卡片的详情抽屉**（2026-11-08 用户要求）。
+  ///
+  /// 与其它上拉抽屉同一套壳（`BwSheetShell`：统一抓手 + 同一圆角/底色），
+  /// 但 `allowDrag: false` —— 用户明确要求**这个抽屉不能被拉高**，
+  /// 内容超出就在抽屉内部滚动，别把整屏变成一层白。
+  void _showToolGroupSheet(List<HToolCall> calls) {
+    showCupertinoModalPopup<void>(
+      context: context,
+      builder: (sheetCtx) {
+        return BwSheetShell(
+          onDismissRequest: () => Navigator.of(sheetCtx).pop(),
+          allowDrag: false,
+          // 2026-11-08 真机修复：Cupertino 路由**没有 Material 祖先**，
+          // 卡片里的 InkWell 会抛「No Material widget found」⇒ 套透明 Material。
+          child: Material(
+            type: MaterialType.transparency,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(sheetCtx).height * 0.62,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  CommandSheetTitle(
+                    title: '工具调用 · ${calls.length} 条',
+                    exitCode: () {
+                      for (final c0 in calls.reversed) {
+                        final e = commandExitCodeOf(c0);
+                        if (e != null) return e;
+                      }
+                      return null;
+                    }(),
+                    onCopy: null,
+                  ),
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.sizeOf(sheetCtx).height * 0.5,
+                    ),
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.only(bottom: 18),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [for (final c in calls) _messageRow(c)],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
   }
 
   /// **「上下文已压缩」轻量提示行**（2026-10-23，用户要求压缩机制可见）。
@@ -5975,61 +6075,74 @@ class _ChatScreenState extends State<ChatScreen> {
   /// + 状态槽（`kStepRowStatusSize` + `kStepRowStatusGap`）+ 文字。
   /// 本行不需要展开（没有箭头），所以先用**空白**占掉箭头槽，小图标放进状态槽
   /// ⇒ 文字起点与分析行完全一致。
+  /// **「上下文已压缩」—— 按*工具卡*的样式展示**（2026-11-05 用户要求）。
+  ///
+  /// 用户原话：「压缩需要像工具一样展示，它可以像一个工具」。
+  /// 之前是一行淡色小字，用户在自己跑任务时**根本看不出压缩有没有发生**。
+  ///
+  /// 现在的信息层级（与工具卡一致）：
+  /// · 头行：图标 + 「压缩上下文」 + 右侧 `条数 前→后`
+  /// · 正文行：`tokens 前 → 后`（估算值，带 `~`），并说明"任务继续"
+  ///
+  /// ⚠️ 不做"一定变少"的假设：摘要本身也占 token，`after` 可能更大。
   Widget _contextCompressedRow(Hue h, _ContextCompressedNote note) {
+    final bm = note.beforeMessages;
+    final am = note.afterMessages;
+    final bt = note.beforeTokens;
+    final at = note.afterTokens;
+    final countText = (bm != null && am != null) ? '$bm → $am 条' : '';
+    final tokenText = (bt != null && at != null && bt > 0 && at > 0)
+        ? '~${formatTokensCompact(bt)} → ~${formatTokensCompact(at)}'
+        : '';
+
     return Padding(
       padding: const EdgeInsets.symmetric(
-          horizontal: kStepRowHPad, vertical: kStepRowVPad),
-      child: Row(
-        children: [
-          // 占掉箭头槽 —— 本行不可展开，但文字必须与分析行对齐
-          const SizedBox(width: kStepRowArrowSize + kStepRowArrowGap),
-          SizedBox(
-            width: kStepRowStatusSize,
-            height: kStepRowStatusSize,
-            child: Icon(
-              // 图标语义 = "老历史被收起来了"。AppIcons 里没有压缩/归档类图标，
-              // 按项目规则直接用 `CupertinoIcons`（名字已核对 SDK：`archivebox`）。
-              CupertinoIcons.archivebox,
-              size: kStepRowStatusSize,
-              color: h.textFaint,
-            ),
-          ),
-          const SizedBox(width: kStepRowStatusGap),
-          Expanded(
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              alignment: Alignment.centerLeft,
-              child: Text(
-                _compressedText(note),
-                maxLines: 1,
-                style: TextStyle(
-                  fontSize: 12,
-                  height: 1.3,
-                  color: h.textDim,
-                ),
+          horizontal: kStepRowHPad, vertical: 4),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        decoration: BoxDecoration(
+          border: Border.all(color: h.border),
+          borderRadius: BorderRadius.circular(HRadius.sm),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(CupertinoIcons.archivebox,
+                size: 17, color: h.textDim),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Text('压缩上下文',
+                          style: TextStyle(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w600,
+                              color: h.text)),
+                      const Spacer(),
+                      if (countText.isNotEmpty)
+                        Text(countText,
+                            style: TextStyle(
+                                fontSize: 12, color: h.textFaint)),
+                    ],
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    [
+                      if (tokenText.isNotEmpty) tokenText,
+                      '老内容已收进摘要，任务继续',
+                    ].join(' · '),
+                    style: TextStyle(fontSize: 12, color: h.textDim),
+                  ),
+                ],
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
-  }
-
-  /// 压缩提示文案：**有 token 数字就带上，缺失/为 0 就降级成不带数字**。
-  ///
-  /// 数字用现成的 [formatTokensCompact]（`models/session_usage.dart`）——
-  /// 不另写一套格式化：两套迟早漂移（本仓库的老教训）。
-  ///
-  /// ⚠️ `afterTokens` **可能 ≥ `beforeTokens`**（摘要文本本身也占 token），
-  /// 这是就事论事的展示，不做"一定变少"的假设（见事件字段 KDoc）。
-  String _compressedText(_ContextCompressedNote note) {
-    final before = note.beforeTokens;
-    final after = note.afterTokens;
-    if (before != null && after != null && before > 0 && after > 0) {
-      return '上下文已达 80%，已压缩历史'
-          '（${formatTokensCompact(before)} → ${formatTokensCompact(after)} tokens），任务继续';
-    }
-    return '上下文已达 80%，已压缩历史，任务继续';
   }
 
   /// **ask_user 弹窗**（2026-10-16 引入；**2026-10-21 改为选项式多题**）。
@@ -7616,6 +7729,8 @@ class _ContextCompressedNote {
     required this.anchor,
     required this.beforeTokens,
     required this.afterTokens,
+    this.beforeMessages,
+    this.afterMessages,
   });
 
   /// 插在 `_messages` 第 [anchor] 条**之前**（= 事件到达时消息列表的长度）。
@@ -7626,6 +7741,11 @@ class _ContextCompressedNote {
   /// ⚠️ 可能 `after >= before`（摘要本身占 token），展示时不做"一定变少"的假设。
   final int? beforeTokens;
   final int? afterTokens;
+
+  /// 压缩前后的**消息条数**（2026-11-05：用户要求压缩像工具一样展示，
+  /// 卡片里要能一眼看到"多少条被收起来了"）。null = 老后端没带。
+  final int? beforeMessages;
+  final int? afterMessages;
 }
 
 /// 「上下文已压缩」提示行（显示行的第三种）。渲染见

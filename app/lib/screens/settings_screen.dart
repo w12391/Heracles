@@ -21,6 +21,8 @@ import '../theme/elastic_switch.dart';
 import '../theme/stretch_segmented.dart';
 import '../theme/theme_reveal.dart';
 import '../data/open_source_licenses.dart';
+import '../models/token_count.dart';
+import '../widgets/model_catalog_row.dart';
 import '../widgets/bw_approval.dart';
 import '../widgets/background_keepalive_card.dart';
 // 技能 / MCP / 自动化三页的入口已移到主页抽屉（2026-11-02 用户裁定），
@@ -129,11 +131,14 @@ class SettingsScreen extends StatelessWidget {
                     title: '模型',
                     // 与聊天页同源同字段（2026-10-15 修 BUG-5 的口径保留）：
                     // effectiveProvider + 「服务商 · 模型名」
+                    // ★ 2026-11-08：副行末尾带上**当前生效的上下文窗口**。
+                    //   用户报过「我填了 128K 却没生效」——真相是值填在**另一个
+                    //   provider 条目**上，当前这条是 0（按默认 128K）。副行里
+                    //   直接写出来，就不会再靠猜。
                     subtitle: s.effectiveProvider == null
                         ? '未选择'
-                        : (s.effectiveProvider!.model.isEmpty
-                            ? s.effectiveProvider!.name
-                            : '${s.effectiveProvider!.name} · ${s.effectiveProvider!.model}'),
+                        : '${s.effectiveProvider!.model.isEmpty ? s.effectiveProvider!.name : '${s.effectiveProvider!.name} · ${s.effectiveProvider!.model}'}'
+                            ' · 窗口 ${s.effectiveProvider!.effectiveContextWindow > 0 ? formatTokenCount(s.effectiveProvider!.effectiveContextWindow) : '未设置(默认128K)'}',
                     onTap: () => _push(
                         context, ModelSettingsPage(controller: controller)),
                   ),
@@ -2513,6 +2518,8 @@ class GeneralSettingsPage extends StatelessWidget {
                 onChanged: controller.setStepDetail,
               ),
             ),
+            // ★ 2026-11-08 用户要求：键盘回车语义可切换（默认「使用独立发送按钮」）
+            const _KeyboardEnterCard(),
             _SettingsCard(
               title: '繁忙时发送',
               subtitle: '任务执行中发消息如何处理',
@@ -3072,6 +3079,15 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
   /// ★ 初值必须来自 [widget.provider.modelCatalog]（2026-10-14
   ///   真机 bug：原来写死 `const []` —— 每次进编辑页目录都空，
   ///   保存后把已存的目录**覆盖回空**，用户"保存了但目录里不显示"）。
+  /// **单轮最大输出 token**（2026-11-05 用户要求可配，留空 = 契约默认 16384）。
+  late final TextEditingController _maxOut = TextEditingController(
+    text: widget.provider.maxOutputTokens > 0
+        ? widget.provider.maxOutputTokens.toString()
+        : '',
+  );
+
+  /// 哪一行模型展开了「窗口 / 输出上限」面板（null = 都收起）。
+  String? _expandedModel;
   late List<String> _modelCatalog = [...widget.provider.modelCatalog];
 
   /// 拉取中（右上角轻量转圈）
@@ -3192,7 +3208,10 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
       // ★ API 协议（2026-10-14）：决定 AgentBridge 分派到哪个 provider
       protocol: _protocol,
       // ★ 上下文长度（2026-10-14）：留空 → 0（用后端默认）
-      contextLength: int.tryParse(_contextLength.text.trim()) ?? 0,
+      // ★ 2026-11-05：允许单位（1M / 128K / 32K / 纯数字）；非法或留空 ⇒ 0（未设置）
+      contextLength: parseTokenCount(_contextLength.text) ?? 0,
+      // ★ 2026-11-05：单轮输出上限也随 provider 保存（留空 = 0 = 契约默认）
+      maxOutputTokens: parseTokenCount(_maxOut.text) ?? 0,
       // ★ 模型能力（2026-10-14 第三版）：从服务端拉到的一并持久化，
       //   否则 App 重启后又退回兜底值（用户实测抓到的 bug）
       modelCapabilities: _modelCapabilities,
@@ -3397,6 +3416,23 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
             children: [
               Text('模型目录', style: TextStyle(fontSize: 13, color: h.textDim)),
               const Spacer(),
+              // ★ 2026-11-05 用户要求：与「获取可用模型」同样的文字按钮样式，
+              //   点一下把目录清空（没有"默认模型"清单，就不假装有 —— 直接清空，
+              //   目录外的 ID 仍可手填直发）。
+              IosTap(
+                onTap: _loadingModels
+                    ? null
+                    : () => setState(() {
+                          _modelCatalog = <String>[];
+                          _expandedModel = null;
+                          _modelsError = null;
+                        }),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: HSpace.xs),
+                  child: Text('恢复默认模型',
+                      style: TextStyle(fontSize: 12, color: h.textDim)),
+                ),
+              ),
               IosTap(
                 onTap: _loadingModels ? null : _fetchModels,
                 child: Padding(
@@ -3446,32 +3482,27 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
                   //   选中的会作为实际发送用的 model（对照参考图：
                   //   「选择基元律动来当模型用是可以点进去选择模型的」）
                   for (final id in _modelCatalog)
-                    CupertinoListTile(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 6),
-                      title: Text(id,
-                          style: TextStyle(
-                              fontSize: 13,
-                              fontFamily: kMonoFontFamily,
-                              fontFamilyFallback: kMonoFallback,
-                              // 选中的高亮
-                              color: id == _model.text ? h.accent : h.text,
-                              fontWeight: id == _model.text
-                                  ? FontWeight.w600
-                                  : FontWeight.w400)),
-                      // 选中态对勾
-                      trailing: id == _model.text
-                          ? Icon(AppIcons.check, size: 17, color: h.accent)
-                          : CupertinoButton(
-                              padding: const EdgeInsets.all(6),
-                              minimumSize: const Size(0, 28),
-                              onPressed: () => setState(() =>
-                                  _modelCatalog =
-                                      [..._modelCatalog]..remove(id)),
-                              child: Icon(AppIcons.trash,
-                                  size: 18, color: h.textFaint),
-                            ),
-                      onTap: () => setState(() => _model.text = id),
+                    ModelCatalogRow(
+                      id: id,
+                      selected: id == _model.text,
+                      expanded: _expandedModel == id,
+                      contextLength: _contextLength,
+                      maxOutput: _maxOut,
+                      onSelect: () => setState(() => _model.text = id),
+                      onToggleExpand: () => setState(() =>
+                          _expandedModel = _expandedModel == id ? null : id),
+                      onRemove: () => setState(() =>
+                          _modelCatalog = [..._modelCatalog]..remove(id)),
+                      // 占位 = 已获取/已设置的值（用户要求：输入框自己展示默认值）
+                      contextPlaceholder:
+                          widget.provider.effectiveContextWindow > 0
+                              ? formatTokenCount(
+                                  widget.provider.effectiveContextWindow)
+                              : '128K',
+                      maxOutputPlaceholder:
+                          widget.provider.maxOutputTokens > 0
+                              ? formatTokenCount(widget.provider.maxOutputTokens)
+                              : '16K',
                     ),
                 ],
               ),
@@ -4892,6 +4923,46 @@ class _AlwaysAllowedRowState extends State<_AlwaysAllowedRow> {
               padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
               child: const Text('清除', style: TextStyle(fontSize: 12)),
             ),
+        ],
+      ),
+    );
+  }
+}
+/// **键盘回车语义**（2026-11-08 用户要求）。
+///
+/// 默认开启「使用独立发送按钮」⇒ 键盘回车**插入换行**，发送只走右下按钮；
+/// 关闭 ⇒ 回到旧行为（回车即发送）。
+/// 值存 `SharedPreferences`（`heracles.separate_send_button`），跨重启保留。
+class _KeyboardEnterCard extends StatefulWidget {
+  const _KeyboardEnterCard();
+
+  @override
+  State<_KeyboardEnterCard> createState() => _KeyboardEnterCardState();
+}
+
+class _KeyboardEnterCardState extends State<_KeyboardEnterCard> {
+  @override
+  Widget build(BuildContext context) {
+    return _SettingsCard(
+      title: '使用独立发送按钮',
+      subtitle: '开启后键盘回车插入换行，发送只走右下按钮；关闭则为回车即发送',
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              AgentBridge.separateSendButton ? '回车 = 换行' : '回车 = 发送',
+              style: const TextStyle(fontSize: 13),
+            ),
+          ),
+          CupertinoSwitch(
+            // 2026-11-08：颜色跟主题（默认 Cupertino 绿和黑白界面不统一）
+            activeTrackColor: Hue.of(context).text,
+            value: AgentBridge.separateSendButton,
+            onChanged: (v) async {
+              await AgentBridge.writeSeparateSendButton(v);
+              if (mounted) setState(() {});
+            },
+          ),
         ],
       ),
     );

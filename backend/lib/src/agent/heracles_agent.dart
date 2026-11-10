@@ -43,6 +43,10 @@ import 'package:dio/dio.dart';
 
 import '../capability/capabilities.dart';
 import '../contract/contract.dart';
+import '../context/compaction/compaction_config.dart';
+import '../context/compaction/compaction_event.dart';
+import '../context/compaction/send_view.dart';
+import '../context/compaction/session_memory.dart';
 import '../context/memory_context.dart';
 import '../context/window_ratio_compressor.dart';
 import '../prompt/memory_prompt.dart';
@@ -170,6 +174,7 @@ class RunOptions {
     this.tokenLimit = ContractRunContinue.runTokenLimit,
     this.resumeFromCheckpoint = const <String, Object?>{},
     this.userSkills = const [],
+    this.compaction = const CompactionConfig(),
   });
 
   final int maxTurns;
@@ -398,6 +403,14 @@ class RunOptions {
   /// backend 据此知道"上次跑到第几轮/花了多少 token/计划是什么"，**不重复消息**、
   /// 不伪造用户消息（续跑用内部 continuation 状态）。
   final Map<String, Object?> resumeFromCheckpoint;
+
+  /// **压缩流水线旋钮**（2026-11-06；默认值全部来自 `ContractCompaction`）。
+  ///
+  /// 只有需要偏离契约默认值的宿主才传（例如想关掉 Session Memory
+  /// 强制每次走模型摘要，或把最近文件从 5 提到 10）。
+  /// **窗口与触发线不在这里**：那两项由 `BackendConfig.modelWindowTokens`
+  /// 与 `ContractCompression.compressAtRatio` 决定（压缩器会覆盖）。
+  final CompactionConfig compaction;
 }
 
 /// **续跑策略**（V0.4）：三档，不能混成一个开关。
@@ -469,7 +482,103 @@ class HeraclesAgent {
   /// 当前状态（只读视图，给 CLI / 宿主看 turn 数与用量）。
   AgentState? get state => _state;
 
-  /// 建 LLM client。
+  /// 本轮 run 用的压缩器（`_drive` 里创建；命令层要读 `lastCompaction`）。
+  WindowRatioCompressor? _activeCompressor;
+
+  /// 命令层（`/compact`、`/rewind`）用的压缩器 —— **跨 run 复用**。
+  ///
+  /// 为什么要跨 run：会话记忆（`SessionMemory`）是**增量**的，
+  /// 复用同一个压缩器实例才能"上一轮抽到的目标/约束"延续下来；
+  /// 每次新建就等于每次都从零抽（模型刚清掉的老消息里才有那些信息）。
+  WindowRatioCompressor? _commandCompressor;
+
+  /// **手动压缩**（`/compact` 命令、UI 的"立即压缩"按钮）。
+  ///
+  /// ## 与自动压缩的差别（只有两条）
+  ///
+  /// 1. **不看阈值**：用户说了算，哪怕现在只用了 10%；
+  /// 2. [focus] 非空 ⇒ **强制走模型摘要**（"这次只保留 XX 相关"，
+  ///    本地规则听不懂这句话）。
+  ///
+  /// ## 绝不抛
+  ///
+  /// 任何失败都体现在返回值的 `failureReason` 里（人话，不含 URL/Key），
+  /// 命令层可以直接上屏 —— 压缩失败不该让 UI 看到异常栈。
+  Future<CompactionEvent> compactNow({String? focus}) async {
+    final st = _state;
+    final compressor = _commandCompressor ??= _buildCompressor();
+    if (st == null) {
+      return const CompactionEvent(
+        trigger: CompactionTrigger.manual,
+        layersRun: <CompactionLayer>[],
+        beforeTokens: 0,
+        afterTokens: 0,
+        elapsedMs: 0,
+        usedApi: false,
+        keptNotes: 0,
+        droppedNotes: 0,
+        failureReason: '当前没有会话状态（还没跑过任何一轮），无可压缩的内容',
+      );
+    }
+    return compressor.compactNow(st, focus: focus);
+  }
+
+  /// **截断发送视图到最近 [rounds] 轮**（`/rewind` 命令用）。
+  ///
+  /// ★ **原始会话记录一个字都不动**（用户拍板 Q5）：返回的 [SendView]
+  /// 是"下一次请求可以用的历史投影"，会话 `.jsonl` 仍是一条不删的
+  /// append-only 记录。命令层拿它去 `run(history:)` 即可。
+  SendView sendViewTruncatedTo(int rounds) {
+    final st = _state;
+    final compressor = _commandCompressor ??= _buildCompressor();
+    if (st == null) {
+      return const SendView(messages: <LLMMessage>[], estTokens: 0);
+    }
+    return compressor.sendViewTruncatedTo(st, rounds);
+  }
+
+  /// 当前发送视图（不清空、不截断；`clearedRefs` 反映最近一次 micro）。
+  SendView buildSendView() {
+    final st = _state;
+    final compressor = _commandCompressor ??= _buildCompressor();
+    if (st == null) {
+      return const SendView(messages: <LLMMessage>[], estTokens: 0);
+    }
+    return compressor.buildSendView(st);
+  }
+
+  /// 最近一次压缩事件（本轮 run 优先，其次命令层那次）。
+  CompactionEvent? get lastCompactionEvent =>
+      _activeCompressor?.lastCompaction ?? _commandCompressor?.lastCompaction;
+
+  /// 压缩事件留档（`CompactionConfig.metricsEnabled` 控制，环形保留）。
+  List<CompactionEvent> get compactionEvents =>
+      _activeCompressor?.events ?? _commandCompressor?.events ?? const [];
+
+  /// 最近一次用于渲染摘要视图的会话记忆（UI 可展示"当前会话记忆是什么"）。
+  SessionMemory? get currentSessionMemory =>
+      _activeCompressor?.lastSessionMemory ??
+      _commandCompressor?.lastSessionMemory;
+
+  /// **建循环探测器**（2026-11-04 真机修后统一入口）。
+  ///
+  /// 两处刻意的口径，理由见 [ContractLoop] / [ContractRunContinue.identicalCallThreshold]：
+  ///
+  /// 1. **阈值 6**（框架默认 5）：判据是"`工具名:参数JSON` 字节完全相同 ×N"，
+  ///    长任务里模型偶尔把同一处补丁再打一遍，5 次就中止太紧；
+  /// 2. **关掉 LLM 自我诊断分支**（`client/modelConfig` 传 null）：真机上它把
+  ///    "在同一个大文件上反复增量编辑"判成打转，**在正常推进时把任务杀了**。
+  LoopDetector _buildLoopDetector(LLMClient client, {String? modelName}) =>
+      DefaultLoopDetector(
+        state: _state!,
+        client: ContractLoop.enableSelfDiagnosedLoopCheck ? client : null,
+        modelConfig: ContractLoop.enableSelfDiagnosedLoopCheck
+            ? _modelConfig(model: modelName)
+            : null,
+        toolLoopThreshold: ContractRunContinue.identicalCallThreshold,
+      );
+
+  /// **建 LLM client**。
   LLMClient _buildClient() {
     final injected = _injectedClient;
     if (injected != null) return injected;
@@ -478,10 +587,15 @@ class HeraclesAgent {
 
   /// 按 [BackendConfig] 建 client（静态：/compact 的摘要调用也用它）。
   static LLMClient buildClientFor(BackendConfig config) {
+    // ★ 2026-11-04：请求墙钟上限显式给足（框架默认 300 s 对推理模型太紧，
+    //   真机上把"首个 chunk 之前的长时间思考"误判成网络故障）。
+    final requestTimeout =
+        Duration(seconds: ContractModel.requestTimeoutSeconds);
     return switch (config.provider) {
       BackendProvider.openAiCompatible => OpenAIClient(
           apiKey: config.apiKey,
           baseUrl: config.baseUrl,
+          timeout: requestTimeout,
         ),
       BackendProvider.anthropic => ClaudeClient(
           apiKey: config.apiKey,
@@ -504,6 +618,77 @@ class HeraclesAgent {
             : <String, dynamic>{'reasoning_effort': _config.reasoningEffort},
       );
 
+  /// **建压缩器**（2026-11-06：单阈值一次性流水线）。
+  ///
+  /// ## 三条口径（用户 2026-11-05/06 裁定，别改回去）
+  ///
+  /// 1. **micro 重新开启**（`enableMicro: true`）：它以前每轮在 40% 线上
+  ///    改写历史中段 ⇒ 缓存命中率只有 40%~48%（用户招牌指标要 80%+）。
+  ///    现在 micro 只在**压缩事件内**跑一次（流水线阶段 1）；
+  /// 2. **单阈值 0.85**：没有 60% 的"提前摘要"，不到线一个字节都不动；
+  /// 3. **重载内容由宿主提供**：读 `AGENTS.md` 与"最近改过的文件"是 IO，
+  ///    backend 不碰 —— 这里把两个读取器接到工作区能力上（见 [_readWorkspaceFile]）。
+  ///
+  /// ## 为什么读取器接「工作区能力」而不是 `dart:io`
+  ///
+  /// backend 是纯 Dart 包（不能 import Flutter，也不知道设备路径）。
+  /// `_caps.workspace` 是宿主注入的统一抽象：App 里是 SAF/fs 通道，
+  /// CLI 里是本地磁盘。走它两边都不需要特判。
+  WindowRatioCompressor _buildCompressor({
+    LLMClient? client,
+    void Function(int, int, int, int)? onCompressed,
+  }) =>
+      WindowRatioCompressor(
+        client: client ?? _injectedClient ?? buildClientFor(_config),
+        modelConfig: _modelConfig(model: _config.summarizerModel),
+        modelWindowTokens: _config.modelWindowTokens,
+        // ★ 生产开启：只在压缩事件内跑一次，不再每轮改写前缀（见 KDoc）
+        enableMicro: true,
+        compactionConfig: _options.compaction,
+        readProjectFile: _readProjectFile,
+        readRecentFile: _readRecentFile,
+        onCompressed: onCompressed,
+      );
+
+  /// 项目指令读取器（`AGENTS.md`，仓库/工作区根）。
+  ///
+  /// 读不到返回 null ⇒ 压缩流水线会**跳过并在摘要视图里如实记一条 note**
+  /// （绝不假装读过；用户 Q4：复用仓库根 AGENTS.md，不新造格式）。
+  Future<String?> _readProjectFile(String fileName) =>
+      _readWorkspaceFile(fileName);
+
+  /// "最近修改的文件"读取器（同样走工作区能力；读不到只列路径）。
+  Future<String?> _readRecentFile(String path) => _readWorkspaceFile(path);
+
+  /// 经工作区能力读一个文本文件，并**去掉行号前缀**。
+  ///
+  /// 为什么去行号：能力层 `read` 给回的是 `"   12| 内容"` 这种**给模型定位用**
+  /// 的形状（`ContractWorkspace.lineNumberWidth`）。注入摘要视图时行号没有意义，
+  /// 还会污染"项目指令"原文（用户会以为 AGENTS.md 里真写着 `   12|`）。
+  Future<String?> _readWorkspaceFile(String path) async {
+    final ws = _caps.workspace;
+    if (ws == null) return null;
+    try {
+      final result = await ws.read(path);
+      if (result is! CapabilitySuccess) return null;
+      return _stripLineNumbers(result.data);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 去掉 `read` 能力加的行号前缀（`"   12| 内容"` → `"内容"`）。
+  static String _stripLineNumbers(String text) {
+    if (text.isEmpty) return text;
+    final out = StringBuffer();
+    for (final line in text.split('\n')) {
+      final m = RegExp(r'^\s*\d+\|\s?').firstMatch(line);
+      out.writeln(m == null ? line : line.substring(m.end));
+    }
+    final s = out.toString();
+    return s.endsWith('\n') ? s.substring(0, s.length - 1) : s;
+  }
+
   /// **会话摘要**（/compact 用，2026-10-24）—— 一次性 LLM 调用，不进 agent 循环。
   ///
   /// ## 为什么是静态独立方法
@@ -525,6 +710,12 @@ class HeraclesAgent {
     required String transcript,
     int maxChars = 4000,
     LLMClient? client,
+    /// 用户指定的压缩重点（`/compact focus on …`）。
+    ///
+    /// 非空时加进**系统提示**（不改写会话正文）：让摘要围绕该主题取舍细节，
+    /// 但"目标 / 用户约束 / 涉及文件 / 未决问题"这些骨架仍然必须保留。
+    /// 空 = 与原行为完全一致。
+    String? focus,
   }) async {
     // `client` 注入点（测试替身用）；生产不传 ⇒ 按配置现建。
     final llm = client ?? buildClientFor(config);
@@ -536,7 +727,8 @@ class HeraclesAgent {
         '3. 关键结论（文件名、行号、报错原文、命令返回值）；\n'
         '4. 未完成事项与卡点。\n'
         '丢弃：寒暄、重复、与任务无关的过程叙述。\n'
-        '直接输出摘要正文，不要开场白和标题，全文不超过 $maxChars 字符。';
+        '直接输出摘要正文，不要开场白和标题，全文不超过 $maxChars 字符。'
+        '${_focusClause(focus)}';
     final msg = await llm.generate(
       [
         SystemMessage(system),
@@ -660,9 +852,35 @@ class HeraclesAgent {
   Map<String, int> contextBreakdown() {
     final st = _state;
     if (st == null) return const <String, int>{};
-    var system = 0;
-    for (final p in _buildSystemPrompts()) {
-      system += WindowRatioCompressor.estimateText(p);
+
+    // ★ 2026-11-05（用户要求按"系统提示词 / 工具定义 / 用户消息 / 注入内容 /
+    //   技能注入 / 工具结果 / 助手消息"拆）：把原先笼统的 `system` 拆成三段 ——
+    //   · 系统提示词 = `defaultSystemPrompt`（人设与环境，字节稳定）
+    //   · 注入内容   = 宿主追加提示 + 长期记忆（每轮可能变）
+    //   · 技能注入   = 技能系统提示（框架拼进 system 的那一段，单独计量）
+    //   三段口径互斥，加起来仍等于原来的 system 总量（不重复计数）。
+    final prompts = _buildSystemPrompts();
+    final systemPrompt = prompts.isEmpty
+        ? 0
+        : WindowRatioCompressor.estimateText(prompts.first);
+    var injected = 0;
+    for (var i = 1; i < prompts.length; i++) {
+      injected += WindowRatioCompressor.estimateText(prompts[i]);
+    }
+    var skills = 0;
+    try {
+      final part = buildSkillSystemPrompt(
+        st,
+        _options.enableSkills
+            ? <Skill>[
+                ...builtinSkills(),
+                for (final s in _options.userSkills) s.toFrameworkSkill(),
+              ]
+            : null,
+      );
+      if (part != null) skills = WindowRatioCompressor.estimateText(part.content);
+    } catch (_) {
+      skills = 0; // 计量失败不影响主功能（分项少一块，不编数）
     }
     var user = 0;
     var assistant = 0;
@@ -679,15 +897,26 @@ class HeraclesAgent {
           break;
       }
     }
-    return <String, int>{
-      'system': system,
+    // ★ 2026-11-04：分项按**服务端真值**等比放大后再给 UI。
+    //   真机上"分项 20K / 总量 104K"并排出现，用户直接失去信任；
+    //   放大后 sum(分项) 精确等于真实总量（见 scaleToRealTotal 的 KDoc）。
+    final parts = <String, int>{
+      // 新七类（2026-11-05，用户指定的口径与顺序）
+      'systemPrompt': systemPrompt,
       'toolDefs': WindowRatioCompressor.estimateToolDefinitions(st),
-      'toolResults': toolResults,
-      'reasoning': 0,
-      'assistant': assistant,
       'user': user,
+      'injected': injected,
+      'skills': skills,
+      'toolResults': toolResults,
+      'assistant': assistant,
+      // ⚠️ 2026-11-05：**不再发旧别名 system**。前端会把"不在七类里的键"
+      //    合并成「其他」⇒ 屏上出现「系统提示词 2.6K + 其他 2.9K」的**重复计数**
+      //    （真机 12:43 抓到）。新前端只认上面七类。
+      'reasoning': 0,
       'summary': 0,
     };
+    final realPrompt = st.usages.isEmpty ? 0 : st.usages.last.promptTokens;
+    return WindowRatioCompressor.scaleToRealTotal(parts, realPrompt);
   }
 
   /// 构建全部工具（**33 个**）。
@@ -1193,26 +1422,23 @@ class HeraclesAgent {
       frameworkError ??= e.error;
     });
 
-    // ---- 压缩器 ----
+    // ---- 压缩器（2026-11-06：单阈值一次性流水线）----
     //
-    // 摘要用小模型（如果配了）：省钱的常规手段。
+    // 详细理由见 [_buildCompressor] 的 KDoc。
     //
     // ## 压缩时机（框架控制，不是我们）
     //
     // 框架在**每一轮循环的最开头、请求发出之前**调 `compress(state)`
-    // （`stateful_agent.dart` 的 `while (true)` 里）。
-    // ⇒ "任务跑到一半也能压缩后继续"**天生成立**，不需要我们额外做什么。
+    // （`stateful_agent.dart` 的 `while (true)` 里）⇒ "任务跑到一半也能压缩后继续"
+    // 天生成立。但**压不压**由压缩器自己判：不到 0.85 线一个字节都不动。
     //
     // ## onCompressed：把"压缩真的发生了"播给 UI
     //
-    // 压缩器与 `emit` 在同一个作用域（都在 `_drive` 里），所以直接闭包捕获。
-    // 回调只在**历史真的变短**时触发（见 `WindowRatioCompressor.onCompressed`），
+    // 回调只在**历史真的变了**时触发（见 `WindowRatioCompressor._afterRun`），
     // 所以这里不用再判断一次 —— 别在两处判同一件事，将来会分叉。
     final summarizerClient = _config.summarizerModel == null ? null : _buildClient();
-    final compressor = WindowRatioCompressor(
+    final compressor = _buildCompressor(
       client: summarizerClient ?? client,
-      modelConfig: _modelConfig(model: _config.summarizerModel),
-      modelWindowTokens: _config.modelWindowTokens,
       onCompressed: (beforeMessages, afterMessages, beforeTokens, afterTokens) {
         emit(HeraclesContextCompressed(
           beforeMessages: beforeMessages,
@@ -1229,6 +1455,7 @@ class HeraclesAgent {
             beforeTokens, afterTokens);
       },
     );
+    _activeCompressor = compressor;
 
     // ---- 工具调用预算（ADR-033 的"真预算"）----
     //
@@ -1366,6 +1593,8 @@ class HeraclesAgent {
           _SteerHook(_options.takeSteerMessage!),
         budgetHook,
         approvalHook,
+        // ★ 2026-11-04：只思考不动手 ⇒ 不许沉默收尾（真机"反复说继续"事故）
+        _ThoughtOnlyGateHook(),
 
         // ★ P0（2026-10-31）：计划自动推进 —— 执行类工具成功后推进一格并播帧。
         if (planProgressHook != null) planProgressHook,
@@ -1393,13 +1622,9 @@ class HeraclesAgent {
           : null,
       disableSubAgents: !_options.enableSubAgents,
       // 框架自带循环检测（相同调用重复 + 周期性 LLM 诊断）。
-      // 旧实现只有"相同调用重复"且阈值 2；这里用框架默认（5），
+      // 旧实现只有"相同调用重复"且阈值 2；这里用 [ContractRunContinue.identicalCallThreshold]，
       // 因为云端模型有自愈能力，2 太激进。
-      loopDetector: DefaultLoopDetector(
-        state: _state!,
-        client: client,
-        modelConfig: _modelConfig(),
-      ),
+      loopDetector: _buildLoopDetector(client),
       autoSaveStateFunc: _stateStorage == null
           ? null
           : (state) async => _stateStorage.save(state),
@@ -1571,14 +1796,19 @@ class HeraclesAgent {
               _SteerHook(_options.takeSteerMessage!),
             budgetHook,
             approvalHook,
+            // ★ 2026-11-04：只思考不动手 ⇒ 不许沉默收尾（降级重跑同样要拦）
+            _ThoughtOnlyGateHook(),
             // ★ P0（2026-10-31）：计划自动推进（同一实例 ⇒ 记账不因换模型重置）
             if (planProgressHook != null) planProgressHook,
           ],
           loopDetector: DefaultLoopDetector(
             state: _state!,
-            client: client,
-            modelConfig: _modelConfig(
-                model: _options.fallbackModelNames[usedFallbackIdx]),
+            client: ContractLoop.enableSelfDiagnosedLoopCheck ? client : null,
+            modelConfig: ContractLoop.enableSelfDiagnosedLoopCheck
+                ? _modelConfig(
+                    model: _options.fallbackModelNames[usedFallbackIdx])
+                : null,
+            toolLoopThreshold: ContractRunContinue.identicalCallThreshold,
           ),
           autoSaveStateFunc: _stateStorage == null
               ? null
@@ -1634,15 +1864,12 @@ class HeraclesAgent {
               _SteerHook(_options.takeSteerMessage!),
             budgetHook,
             approvalHook,
+            // ★ 2026-11-04：只思考不动手 ⇒ 不许沉默收尾（降级重跑同样要拦）
+            _ThoughtOnlyGateHook(),
             // ★ P0（2026-10-31）：计划自动推进（同一实例）
             if (planProgressHook != null) planProgressHook,
           ],
-          loopDetector: DefaultLoopDetector(
-            state: _state!,
-            client: client,
-            modelConfig: _modelConfig(
-                model: _options.fallbackModelNames[usedFallbackIdx]),
-          ),
+          loopDetector: _buildLoopDetector(client, modelName: _options.fallbackModelNames[usedFallbackIdx]),
           autoSaveStateFunc: _stateStorage == null
               ? null
               : (state) async => _stateStorage.save(state),
@@ -1871,16 +2098,19 @@ class HeraclesAgent {
   String _describeException(Exception e) {
     if (e is AgentException) {
       return switch (e.code) {
-        AgentExceptionCode.loopDetection =>
-          '检测到循环：模型反复请求相同的操作。任务已停止，避免反复修改同一文件。'
-              '如果确实需要继续，请把需求拆成更小的步骤重试。',
+        // ★ 2026-11-05 修：**轮次用尽 ≠ 死循环**。两者都复用 `loopDetection` 这个
+        //   异常码（框架只有 5 个码），但话术必须分开 —— 真机上用户看到
+        //   「检测到循环：完全相同的调用连续重复」而实际是 `Maximum turns reached (40)`，
+        //   完全误导（他没在循环，只是任务太大/每轮固定开销太高）。
+        AgentExceptionCode.loopDetection => describeLoopFailure(e.message),
         AgentExceptionCode.cancelled => '任务已取消。',
         AgentExceptionCode.stopByController => '任务被停止规则拦截。',
         AgentExceptionCode.resumeFailed => '无法恢复上次中断的任务：${e.message}',
-        AgentExceptionCode.unknown => '任务异常：${e.message}',
+        AgentExceptionCode.unknown =>
+          '任务异常：${describeFailureMessage(e.message)}',
       };
     }
-    return '任务异常：$e';
+    return '任务异常：${describeFailureMessage(e.toString())}';
   }
   /// **worker 子代理工厂**（H6，2026-10-24）—— 干净上下文的执行者。
   ///
@@ -1920,8 +2150,14 @@ class HeraclesAgent {
             compressor: parent.compressor,
             loopDetector: DefaultLoopDetector(
               state: workerState,
-              client: parent.client,
-              modelConfig: parent.modelConfig,
+              // ★ worker 同样关掉"自我诊断"分支（理由见 ContractLoop）
+              client: ContractLoop.enableSelfDiagnosedLoopCheck
+                  ? parent.client
+                  : null,
+              modelConfig: ContractLoop.enableSelfDiagnosedLoopCheck
+                  ? parent.modelConfig
+                  : null,
+              toolLoopThreshold: ContractRunContinue.identicalCallThreshold,
             ),
             hooks: parent.hooks,
             // 独立事件总线：worker 的过程事件无人订阅 ⇒ 隔离（见上方注释 1）
@@ -2211,6 +2447,87 @@ class _SteerHook extends AgentHook {
     final text = raw?.trim() ?? '';
     if (text.isEmpty) return const TurnCompletionHookResult.accept();
     return TurnCompletionHookResult.continueWith([UserMessage.text(text)]);
+  }
+}
+
+/// **只思考不动手门禁**（2026-11-04）—— 拦"假装在干活"的沉默收尾。
+///
+/// ## 真机现场（用户 2026-11-03 22:29 截图）
+///
+/// 下发完整任务后，每一轮只有 `分析完成` / `思考完成`，**没有正文、没有写文件**，
+/// 然后这一轮就结束了 —— 用户必须反复手打「继续」，任务永远推进不了。
+///
+/// ## 为什么框架不会拦（必须在装配层堵）
+///
+/// `stateful_agent.dart` 的 `_ModelMessageAccumulator.isEmptyResponse` 把
+/// 「只有 thought」判成**真实一轮**（有意为之：思考也是模型产出），于是
+/// 「空响应重试」不触发；主循环再看到 `functionCalls.isEmpty` ⇒ `break`
+/// ⇒ 整轮 run **正常结束**。用户那边既没有正文也没有错误 —— 最坏的失败形态。
+///
+/// ## 本 hook 的两级处置
+///
+/// 1. **还有续跑预算**（框架 `maxTurnContinuations`）：注入一条明确的行动指令，
+///    把"继续分析"顶成"立刻动手"，并把 `stop_reason`/输出 token 数说清楚；
+/// 2. **预算用尽仍只思考**：抛一个**可见的**失败（不是沉默结束），
+///    理由含诊断数字（stop_reason、输出 tokens），用户能据此判断是该换模型、
+///    调小思考强度，还是把任务拆小。
+///
+/// ## 边界（刻意不做的事）
+///
+/// · 有正文 ⇒ 放行（正常收尾）；
+/// · 有工具调用 ⇒ 放行（在干活）；
+/// · thought 也是空（真正零产出）⇒ 交给框架既有的「空响应重试」路径，不抢。
+class _ThoughtOnlyGateHook extends AgentHook {
+  @override
+  Future<TurnCompletionHookResult> onTurnCompletion(
+    TurnCompletionHookContext context,
+  ) async {
+    final m = context.finalMessage;
+    // 有正文 / 有工具调用 ⇒ 不是本 hook 的事
+    if ((m.textOutput ?? '').trim().isNotEmpty) {
+      return const TurnCompletionHookResult.accept();
+    }
+    if (m.functionCalls.isNotEmpty) {
+      return const TurnCompletionHookResult.accept();
+    }
+    final thought = (m.thought ?? '').trim();
+    // 连思考都没有 ⇒ 框架的空响应重试 + 循环检测负责，这里不插手
+    if (thought.isEmpty) return const TurnCompletionHookResult.accept();
+
+    final stop = m.stopReason ?? 'unknown';
+    final completionTokens = m.usage?.completionTokens;
+    final truncated = stop == 'length' ||
+        stop == 'max_tokens' ||
+        stop == 'max_completion_tokens';
+    final tokenNote =
+        completionTokens == null ? '' : '，本轮输出 $completionTokens tokens';
+
+    // ---- 还有预算：推它一把（说清"只分析不行，必须动手"）----
+    final remaining =
+        context.maxContinuations - context.continuationCount - 1;
+    if (remaining > 0) {
+      return TurnCompletionHookResult.continueWith([
+        UserMessage.text(
+          '[系统提醒] 你上一轮**只输出了思考**：没有任何正文，也没有调用任何工具'
+          '（stop_reason=$stop$tokenNote）。'
+          '用户看到的只有「思考完成」，任务一点没推进。\n'
+          '现在请立刻动手，二选一：\n'
+          '1) 调用工具推进任务（例如 write_file / run_shell_command / read_file）；\n'
+          '2) 如果确实做完了或做不了，用**正文**明确告诉用户结论与原因。\n'
+          '${truncated ? '⚠️ 上一轮被输出上限截断：这次只做**最小的一步**，'
+              '不要在思考里长篇铺陈。' : ''}',
+        ),
+      ]);
+    }
+
+    // ---- 预算用尽：可见失败（绝不沉默收尾）----
+    throw AgentException(
+      AgentExceptionCode.unknown,
+      '模型连续 ${context.continuationCount + 1} 轮**只输出思考**，'
+          '既没有正文也没有工具调用，任务没有推进'
+          '（stop_reason=$stop$tokenNote）。'
+          '${truncated ? '疑似输出上限被思考吃光：建议把任务拆小、调低思考强度，或换模型重试。' : '建议换个更明确的下发方式，或换模型重试。'}',
+    );
   }
 }
 
@@ -2619,6 +2936,149 @@ class FailureStopClassification {
   /// null = 普通失败（不归为"可继续的停止"，仍走 `failed` 事件）。
   final RunStopReason? reason;
   final bool canContinue;
+}
+
+/// **把底层异常文本翻成人话，而且不许把超时说成"网络不好"**（2026-11-04）。
+///
+/// ## 为什么必须做这一层（真机事故）
+///
+/// 真机 2026-11-04 09:29：用户在网络完全正常的情况下看到
+/// **「网络连接失败：请检查网络后重试。」**。真相是 Dio 的 `receiveTimeout`
+/// 到点（原始文本 `The request connection took longer than 0:05:00…`）——
+/// 里面带 `connection` 这个词，而 UI 的关键词表把 `connection` 一律当网络故障。
+/// 于是用户被指向一个**根本不存在的问题**。
+///
+/// 所以这里在**后端**就把错误种类认清楚并写成中文：
+///
+/// | 原始特征 | 翻成 | 为什么 |
+/// |---|---|---|
+/// | `took longer than 0:05:00` / `timeout` | **超时**（带时限） | 它是本地等了太久，不是断网 |
+/// | `closed before full header` / `reset` / `broken pipe` | 对端**提前中断** | 对端拒绝/代理截断，改网络没用 |
+/// | `failed host lookup` | **DNS 解析失败** | 这个才是网络问题 |
+/// | `certificate` / `handshake` | **TLS/证书** | 自签或中间人代理 |
+/// | `HTTP 4xx/5xx` | **服务端状态码** | 有码就先把码给出来 |
+///
+/// ⚠️ 纪律：**不吞原始信息**（兜底分支原样给出，截断到 200 字），
+/// 但也不把英文原串塞进"已归类"的分支里 —— 那会让 UI 的关键词表再次误判。
+/// 这条 `loopDetection` 异常是不是「轮次用尽」（而不是真的死循环）？
+///
+/// 框架把两种完全不同的终止都塞进 `AgentExceptionCode.loopDetection`：
+/// · `Maximum turns reached (40)` —— 轮次用尽（任务太大 / 每轮固定开销太高）；
+/// · `Tool call loop detected…` —— 真的在重复同一个调用。
+/// 话术必须分开：真机 2026-11-05 用户看到「检测到循环：完全相同的调用连续重复」，
+/// 而实际是轮次用尽 —— 完全误导（他没在循环，只是任务太大）。
+/// **`loopDetection` 两种终止的人话**（纯函数，可测）。
+///
+/// 拆出来是为了能单测：话术必须区分"轮次用尽"和"真的死循环"。
+String describeLoopFailure(String message) {
+  if (_isTurnsExhausted(message)) {
+    return '轮次用尽：这一轮跑满了设定的最大轮次（原始信息：'
+        '${_clipForFailure(message, 80)}）。'
+        '常见原因是任务太大、或每轮固定开销（系统提示 + 工具定义）吃掉了额度 —— '
+        '可以：把任务拆成更小的步骤、在设置里提高「最大轮次」，或换更省 token 的做法。';
+  }
+  return '检测到循环：模型把**完全相同的调用**连续重复了多次'
+      '（${_clipForFailure(message, 120)}）。'
+      '任务已停止以避免空转；如果任务还没做完，请把需求拆成更小的步骤再试。'
+      '注意：在同一个文件上连续做**不同**的编辑属于正常推进，不会触发这条。';
+}
+/// focus 条款：空串（行为与旧版一致）或一段明确的「本次重点」说明。
+///
+/// 只加进**系统提示**，不改写会话正文 —— 摘要围绕重点取舍细节，
+/// 但「目标 / 用户约束 / 涉及文件 / 未决问题」仍然必须保留。
+String _focusClause(String? focus) {
+  final t = (focus ?? '').trim();
+  if (t.isEmpty) return '';
+  return '\n\n## 本次压缩的重点（用户指定）\n$t\n'
+      '围绕这个重点取舍细节，但**目标、用户约束、涉及文件、未决问题**仍然必须保留。';
+}
+
+bool _isTurnsExhausted(String message) {
+  final m = message.toLowerCase();
+  return m.contains('maximum turns') || message.contains('轮次');
+}
+
+String describeFailureMessage(String raw) {
+  final s = raw.trim();
+  if (s.isEmpty) return '后端没有给出失败原因（空消息）';
+  final lower = s.toLowerCase();
+
+  // ---- 0) 余额不足（402）—— 必须说人话并给出充值入口、且**绝不重试** ----
+  //
+  // 真机 2026-11-05：上游回 402 `INSUFFICIENT_BALANCE`（"账户余额不足"），
+  // 我们把原始 JSON 糊在界面上，用户完全不知道"这是没充钱"；更糟的是客户端
+  // 还把它当普通网络错误重试 3 次 ⇒ 发出去了却什么都不发生。
+  // 这类错误在 client 层已被拦住不再重试，文案在这里指向充值地址。
+  if (lower.contains('insufficient_balance') ||
+      lower.contains('insufficient balance') ||
+      lower.contains('payment required') ||
+      s.contains('余额不足')) {
+    final url = RegExp(r'https?://[^"\s)]+').firstMatch(s)?.group(0);
+    return '账户余额不足：模型服务拒绝了这次请求（HTTP 402）。'
+        '${url == null ? '' : '充值地址：$url ；'}'
+        // ⚠️ 文案里刻意**不出现「网络」二字**：前端 humanize 会据此把原因改写成
+        //    「网络连接失败」（真踩过：402 被说成没网）。
+        '充值后重发即可 —— 与断网无关，充值到账后重发这条消息就行。';
+  }
+
+  // ---- 1) 超时（最常见：推理模型在大上下文上想太久）----
+  if (lower.contains('longer than') ||
+      lower.contains('timeout') ||
+      lower.contains('timed out') ||
+      lower.contains('timedout') ||
+      s.contains('超时')) {
+    final m = RegExp(r'longer than (\d+:\d+:\d+(?:\.\d+)?)').firstMatch(lower);
+    final limit = m == null ? '请求时限' : '${m.group(1)} 上限';
+    return '模型响应超时：$limit 内没有收到任何数据（本地已按配置自动重试）。'
+        '常见原因是上下文太大、模型思考太久，或中转站排队；'
+        '可精简上下文或把任务拆小后重试。';
+  }
+
+  // ---- 2) 对端提前中断（不是"你没网"，而是这次请求被对面掐了）----
+  if (lower.contains('closed before full header') ||
+      lower.contains('connection closed') ||
+      lower.contains('connection reset') ||
+      lower.contains('broken pipe') ||
+      lower.contains('stream was reset') ||
+      lower.contains('unexpected end of stream') ||
+      lower.contains('premature')) {
+    return '连接被对端提前中断：服务端或代理在这次请求返回完整响应前就关闭了连接'
+        '（常见于请求体过大、被网关拦截或长连接被中间设备剪断）。'
+        '可减少一次塞入的上下文后重试。';
+  }
+
+  // ---- 3) DNS：这才是真正的网络问题 ----
+  if (lower.contains('failed host lookup') ||
+      lower.contains('no address associated') ||
+      lower.contains('nodename nor servname') ||
+      lower.contains('name or service not known') ||
+      lower.contains('dns')) {
+    return '网络域名解析失败（DNS）：请检查网络、代理或 Base URL 是否拼写正确。';
+  }
+
+  // ---- 4) TLS / 证书 ----
+  if (lower.contains('certificate') ||
+      lower.contains('handshake') ||
+      lower.contains('tls') ||
+      lower.contains('ssl')) {
+    return 'TLS 握手/证书校验失败：常见于自签证书、企业代理或系统时间不正确。';
+  }
+
+  // ---- 5) HTTP 状态码（有码就先给码）----
+  final codeMatch = RegExp(r'\b(4\d{2}|5\d{2})\b').firstMatch(s);
+  if (codeMatch != null && lower.contains('openai')) {
+    return '模型服务返回 HTTP ${codeMatch.group(1)}：'
+        '${_clipForFailure(s, 160)}';
+  }
+
+  // ---- 6) 兜底：原样给（截断），绝不编造 ----
+  return _clipForFailure(s, 200);
+}
+
+/// 失败文案里的原文截断（不引入省略号歧义：有截断才加 `…`）。
+String _clipForFailure(String s, int max) {
+  final one = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+  return one.length <= max ? one : '${one.substring(0, max)}…';
 }
 
 /// **把一次失败收尾归类成 `RunStopReason`**（V0.4 纯函数）。

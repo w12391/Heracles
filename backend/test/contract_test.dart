@@ -22,12 +22,12 @@ import 'package:test/test.dart';
 /// **改这些数字 = 改产品契约**，必须先有新的实测数据。
 void main() {
   group('ContractAgent — 编排预算（ADR-033）', () {
-    test('★★★ maxTurns = 40（20 轮不够、60 轮以上必然打转）', () {
-      expect(ContractAgent.maxTurns, 40);
+    test('★★★ maxTurns 已取消上限（2026-11-05 用户裁定：无限制）', () {
+      expect(ContractAgent.maxTurns, greaterThanOrEqualTo(1000000000));
     });
 
-    test('★★★ maxToolCalls = 200（真实逆向任务 120 上下 + 60% 余量）', () {
-      expect(ContractAgent.maxToolCalls, 200);
+    test('★★★ maxToolCalls 已取消上限（用户裁定：无限制）', () {
+      expect(ContractAgent.maxToolCalls, greaterThanOrEqualTo(1000000));
     });
   });
 
@@ -46,9 +46,9 @@ void main() {
   });
 
   group('ContractCompression — 上下文压缩', () {
-    test('★★★ compressAtRatio = 0.80（用户要求 80%）', () {
+    test('★★★ compressAtRatio = 0.85（2026-11-04 用户确认的强制线）', () {
       // 注意是 double 而不是 int：0.5 太频繁、0.95 会先撞窗口
-      expect(ContractCompression.compressAtRatio, 0.80);
+      expect(ContractCompression.compressAtRatio, 0.85);
       expect(ContractCompression.compressAtRatio, isA<double>());
     });
 

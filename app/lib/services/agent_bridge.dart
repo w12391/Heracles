@@ -197,10 +197,207 @@ class AgentBridge {
   static final StreamController<AgentEvent> _localEvents =
       StreamController<AgentEvent>.broadcast();
 
-  /// 把进程内事件推给所有订阅者（由 [run] 的事件泵调用）。
+  /// **把进程内事件推给所有订阅者**（由 [run] 的事件泵调用）。
   static void emitLocalEvent(AgentEvent e) {
+    // ★ 2026-11-04：顺手把 `context_updated` 帧里的**窗口上限**记下来（含落盘）。
+    //
+    // 为什么必须在这里记：环图/用量抽屉的上限此前**只活在本次进程里**
+    // ——`contextLimitTokens()` 读的是静态 `_lastContextLimit`，而它只在
+    // `run()` 收尾时被赋值。于是「装完新版/杀进程后重新打开旧会话」
+    // 上限立刻变回 -1，顶栏与抽屉都显示 `—`（用户 2026-11-04 11:11 报的就是它）。
+    // 帧是**后端权威值**（它自己算压缩线用的同一个数），落盘后重开也有数。
+    final lim = e.limit;
+    if (e.type == AgentEvent.kContextUpdated && lim != null && lim > 0) {
+      _rememberContextLimit(lim, e.limitSource);
+    }
+    // ★ 2026-11-06：记住"上一次真实输入 token"（= 分项之和，后端按真值等比放大过）。
+    //   为什么必须记：新一轮开始时 backend 的 `state.usages` 是空的，压缩决策只能
+    //   退回字符估算（低估 2.5~3.5 倍）⇒ 真机出现"上下文 122%、压缩从不触发"。
+    if (e.type == AgentEvent.kContextCompressed) {
+      // ★ 2026-11-08：压缩事件**落盘**。界面提示是瞬态（换会话就清），
+      //   而"到底压过几次、压了多少"必须能回看 —— 否则用户永远只能猜。
+      debugPrint('[compact] before=${e.beforeTokens} after=${e.afterTokens} '
+          'msgs=${e.beforeMessages}->${e.afterMessages}');
+      unawaited(_persistCompactRow(e));
+    }
+    if (e.type == AgentEvent.kContextUpdated) {
+      final bd = e.breakdown;
+      if (bd != null && bd.isNotEmpty) {
+        final sum = bd.values.fold<int>(0, (a, v) => a + v);
+        if (sum > 0) _rememberPromptTokens(sum);
+      }
+    }
     if (!_localEvents.isClosed) _localEvents.add(e);
   }
+
+  /// 记下窗口上限（内存 + 落盘）。**只在值变化时**写盘，避免每轮一次 IO。
+  static void _rememberContextLimit(int limit, String? source) {
+    if (limit <= 0) return;
+    final changed = limit != _lastContextLimit || source != _lastContextLimitSource;
+    _lastContextLimit = limit;
+    if (source != null && source.isNotEmpty) _lastContextLimitSource = source;
+    if (!changed) return;
+    // 落盘失败不影响任何功能（只是下次启动又会显示 —，不静默改语义）。
+    unawaited(() async {
+      try {
+        final p = await SharedPreferences.getInstance();
+        await p.setInt(_contextLimitKey, limit);
+        final s = _lastContextLimitSource;
+        if (s.isNotEmpty) await p.setString(_contextLimitSourceKey, s);
+      } catch (_) {
+        // 忽略
+      }
+    }());
+  }
+
+  /// **仅测试**：把用量相关的静态缓存清回"没跑过"。
+  ///
+  /// 为什么必须有：`_lastFrozenTokens` / `_lastContextLimit` / `_lastContextBreakdown`
+  /// 都是**进程级静态**（与 `_localEvents` 同理，用量必须全局唯一）。
+  /// 静态值会在同一个测试进程的用例之间**串味** —— 前一条用例设过的上限
+  /// 会让后一条的"未知应为 -1"断言拿到旧值。测试必须能显式重置。
+  @visibleForTesting
+  static void debugResetUsageCache() {
+    _lastFrozenTokens = -1;
+    _lastContextBreakdown = const <String, int>{};
+    _lastContextLimit = -1;
+    _lastContextLimitSource = '';
+  }
+
+  /// 窗口上限落盘的键（跨进程重启仍可读）。
+  /// **自动压缩阈值**（`/autocompact 0.9` 写进来；0.05~0.95 之外忽略）。
+  ///
+  /// 存 `SharedPreferences`：阈值是**用户偏好**，跨重启要还在。
+  /// 读不到 = 用 backend 契约默认（`ContractCompaction.autoCompactThreshold`）。
+  static const String _autoCompactKey = 'heracles.autocompact_threshold';
+
+  /// 上一次真实输入 token 的**同步缓存**（`local_agent` 在非 async 处读它）。
+  ///
+  /// ⚠️ 必须**按会话**成立：`_knownPromptSession` 记录它属于哪个会话，
+  /// 换会话就归零 —— 否则新会话首轮会被上个会话的体积顶过 85% 线而白压一次。
+  static int knownPromptTokens = 0;
+  static String _knownPromptSession = '';
+  static String _activeSessionId = '';
+  static String _activeWorkspacePath = '';
+
+  /// **对外入口**：只有"当前会话"的已知体积才算数（会话切换后自动为 0）。
+  static int get knownPromptTokensForActiveSession =>
+      _knownPromptSession == _activeSessionId ? knownPromptTokens : 0;
+  static const String _knownPromptKey = 'heracles.last_prompt_tokens';
+
+  /// **「使用独立发送按钮」**（2026-11-08 用户要求，默认开）。
+  ///
+  /// 开 ⇒ 键盘回车插入换行，发送只走右下按钮；
+  /// 关 ⇒ 回旧行为（回车即发送）。
+  /// 存 prefs：跨重启要还在；`separateSendButtonForUi` 是同步读的入口。
+  static bool separateSendButton = true;
+  static const String _separateSendKey = 'heracles.separate_send_button';
+
+  /// 同步读（UI 在 build 里用）。
+  bool get separateSendButtonForUi => separateSendButton;
+
+  static Future<void> loadSeparateSendButton() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      separateSendButton = p.getBool(_separateSendKey) ?? true;
+    } catch (_) {}
+  }
+
+  static Future<void> writeSeparateSendButton(bool v) async {
+    separateSendButton = v;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setBool(_separateSendKey, v);
+    } catch (_) {}
+  }
+
+  /// 把一次**自动压缩**写进会话 JSONL（`role: compact`, `auto: true`）。
+  ///
+  /// 只追加、不改历史：原始消息一个字节都不动（append-only 铁律）。
+  /// 写失败只打日志、绝不打断 run —— 观测是附加品，不能反噬执行。
+  static Future<void> _persistCompactRow(AgentEvent e) async {
+    final sid = _activeSessionId;
+    final ws = _activeWorkspacePath;
+    if (sid.isEmpty || ws.isEmpty) return;
+    try {
+      // 静态事件路径里没有实例的 _storeFor 缓存 —— 直接建一个即可
+      final store = SessionStore(workspaceRoot: ws);
+      await store.appendMessage(sid, {
+        'role': 'compact',
+        'auto': true,
+        'beforeTokens': e.beforeTokens,
+        'afterTokens': e.afterTokens,
+        'beforeMessages': e.beforeMessages,
+        'afterMessages': e.afterMessages,
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      });
+    } catch (err) {
+      debugPrint('[compact] persist failed: $err');
+    }
+  }
+
+  static void _rememberPromptTokens(int v) {
+    if (v <= 0) return;
+    final sid = _activeSessionId;
+    // 没有会话 id 时**不记**：宁可不优化，也不许把别的会话的体积带过来。
+    if (sid.isEmpty) return;
+    knownPromptTokens = v;
+    _knownPromptSession = sid;
+    unawaited(() async {
+      try {
+        final p = await SharedPreferences.getInstance();
+        await p.setInt('$_knownPromptKey.$sid', v);
+      } catch (_) {}
+    }());
+  }
+
+  /// 从 prefs 刷新缓存（run 开始时调一次）。
+  /// 刷新"上一次真实输入 token"缓存 —— **按会话**（别的会话的值绝不复用）。
+  static Future<void> refreshKnownPromptTokens(String sessionId) async {
+    _activeSessionId = sessionId;
+    _knownPromptSession = sessionId;
+    knownPromptTokens = 0;
+    if (sessionId.isEmpty) return;
+    try {
+      final p = await SharedPreferences.getInstance();
+      final v = p.getInt('$_knownPromptKey.$sessionId') ?? 0;
+      if (v > 0) knownPromptTokens = v;
+    } catch (_) {}
+  }
+
+  /// /autocompact 的**同步缓存**（local_agent 在非 async 处读它）。
+  static double? autoCompactOverride;
+
+  /// 从 prefs 刷新缓存（app 启动 / 每次 run 前调一次即可）。
+  static Future<void> refreshAutoCompactOverride() async {
+    autoCompactOverride = await readAutoCompactThreshold();
+  }
+
+  static Future<double?> readAutoCompactThreshold() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final v = p.getDouble(_autoCompactKey) ?? p.getInt(_autoCompactKey)?.toDouble();
+      if (v == null) return null;
+      if (v <= 0.05 || v >= 0.95) return null;
+      return v;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<bool> writeAutoCompactThreshold(double v) async {
+    if (v <= 0.05 || v >= 0.95) return false;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setDouble(_autoCompactKey, v);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static const String _contextLimitKey = 'heracles.context_limit';
+  static const String _contextLimitSourceKey = 'heracles.context_limit_source';
 
   /// 把平台通道的 Map 转成 `Map<String, dynamic>`。
   ///
@@ -462,6 +659,9 @@ class AgentBridge {
   static Map<String, int> _lastContextBreakdown = const <String, int>{};
   static int _lastContextLimit = -1;
 
+  /// 上限的**来源说明**（「服务端上报」/「按契约默认值」…）。与上限一起落盘。
+  static String _lastContextLimitSource = '';
+
   /// 上一次运行的**冻结区** token；`-1` = 还没跑过任何一次。
   ///
   /// 冻结区 = 系统提示词 + 工具定义 + 工具协议，会话内逐字节不变
@@ -479,10 +679,23 @@ class AgentBridge {
 
   /// 上下文上限（token）。`<= 0` = 未知（不画进度条）。
   ///
-  /// 来源：用户在「设置 → 模型」里配置的 provider 的 `contextLength`
-  /// （由 `fetchModels` 从服务端读到）。**不再走通道** —— 通道那头已经没有了。
-  Future<int> contextLimitTokens({required bool isCloud}) async =>
-      _lastContextLimit;
+  /// 来源优先级（2026-11-04 补）：
+  /// 1. 本次进程里收到过的 `context_updated` 帧 / 最近一次 run 收尾；
+  /// 2. **上次进程落盘的值**（`heracles.context_limit`）—— 修「重开旧会话变回 `—`」。
+  Future<int> contextLimitTokens({required bool isCloud}) async {
+    if (_lastContextLimit > 0) return _lastContextLimit;
+    try {
+      final p = await SharedPreferences.getInstance();
+      final v = p.getInt(_contextLimitKey) ?? -1;
+      if (v > 0) {
+        _lastContextLimit = v;
+        _lastContextLimitSource = p.getString(_contextLimitSourceKey) ?? '';
+      }
+    } catch (_) {
+      // 读不到就保持"未知"（不猜）
+    }
+    return _lastContextLimit;
+  }
 
   // ------------------------------------------------------------ 工作区
 
@@ -795,6 +1008,12 @@ class AgentBridge {
     String treeUri = '',
     List<HAttachment> attachments = const [],
   }) async {
+    // 2026-11-06: refresh cached knobs before building the executor.
+    // They are read synchronously elsewhere, and a stale 0 makes the
+    // compaction decision blind to the real prompt size.
+    await refreshAutoCompactOverride();
+    await refreshKnownPromptTokens(sessionId ?? '');
+    _activeWorkspacePath = workspacePath;
     final provider = settings.effectiveProvider;
 
     // ★★ 未配置 provider ⇒ **就地明确失败**（2026-10-18，ADR-035 S4）★★
@@ -905,9 +1124,13 @@ class AgentBridge {
         _lastContextBreakdown = executor.lastBreakdown;
         // ★ 与帧/抽屉同一口径（2026-10-29）：逐模型能力优先，
         //   见 [ModelProviderConfig.effectiveContextWindow]。
-        _lastContextLimit = provider.effectiveContextWindow > 0
-            ? provider.effectiveContextWindow
-            : -1;
+        // ★ 2026-11-04：**不要再用 -1 覆盖**已知值 —— provider 能力没拉到时
+        //   （很常见：中转站没 /models 能力）这里原本会把帧刚记下的权威值抹成 -1，
+        //   于是抽屉又变 `—`。现在只有拿到正数才更新，并且照样落盘。
+        final fromProvider = provider.effectiveContextWindow;
+        if (fromProvider > 0) {
+          _rememberContextLimit(fromProvider, '服务端上报');
+        }
         return r;
       } finally {
         // ★ 2026-10-25：**不再 `await` 这个 cancel**。
@@ -1241,6 +1464,8 @@ class AgentBridge {
     required String workspacePath,
     required String sessionId,
     required AppSettings settings,
+    /// `/compact focus on …` 的重点（null/空 = 与旧行为一致）。
+    String? focus,
   }) async {
     final provider = settings.effectiveProvider;
     if (provider == null || !settings.hasUsableProvider) {
@@ -1284,6 +1509,7 @@ class AgentBridge {
         },
       ),
       transcript: transcript,
+      focus: focus,
     );
     if (summary.isEmpty) {
       throw const AgentBridgeException('模型没有返回摘要内容，未写入压缩标记');
