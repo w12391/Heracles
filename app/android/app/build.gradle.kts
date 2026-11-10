@@ -1,3 +1,9 @@
+// ★ 2026-11-10：正式版签名要用 Properties / File，Kotlin DSL 脚本里
+//   不能写全限定名（实测 `java.util.Properties()` 会报 Unresolved reference 'util'），
+//   必须像普通 Kotlin 文件一样先 import。
+import java.io.File
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -28,6 +34,59 @@ repositories {
     mavenCentral()
     maven("https://jitpack.io")
     maven("https://mirrors.cloud.tencent.com/nexus/repository/maven-public/")
+}
+
+// ---------------------------------------------------------------------------
+// ★ 正式版签名（2026-11-10，用户裁定：「后续全部用正式版的」）
+//
+// ## 为什么以前是 debug 签名
+//
+// 本文件原来这里是 Flutter 模板留下的 TODO —— `release` 构建套的是
+// `signingConfigs.getByName("debug")`。也就是说 **0.4.x 一直到 0.5.1 的发布包
+// 全是 Android Debug 证书**（`apksigner verify --print-certs` 实测
+// `CN=Android Debug`），只是能装、能跑，**不是正式签名**。用户 2026-11-10 要求
+// 改成正式版，故有此段。
+//
+// ## 凭据从哪来
+//
+// `app/android/key.properties`（**已 gitignore，永不入库**）：
+// ```properties
+// storeFile=/绝对路径/heracles-release.jks
+// storePassword=…
+// keyAlias=heracles
+// keyPassword=…
+// ```
+// 密钥本体在仓库外的私有目录（本机：`.dshwork/staging/.secrets/`）。
+//
+// ## 没有凭据时会怎样
+//
+// Debug 构建照常走 Android debug 签名。Release 构建则**硬失败**，绝不回退
+// debug —— 否则很容易把「看起来成功」的 debug 证书包再次误发给用户。
+// 完整源码 checkout 如果没有本机 key.properties，可以照常 `flutter build apk --debug`；
+// release 必须先从受控私密备份恢复正式密钥。
+// ---------------------------------------------------------------------------
+val heraclesKeyPropsFile = rootProject.file("key.properties")
+val heraclesHasReleaseKey = heraclesKeyPropsFile.exists()
+val heraclesReleaseRequested = gradle.startParameter.taskNames.any {
+    it.contains("release", ignoreCase = true)
+} ||
+    gradle.startParameter.taskNames.isEmpty()
+if (heraclesReleaseRequested && !heraclesHasReleaseKey) {
+    throw GradleException(
+        "正式 release 构建被拒绝：缺少 app/android/key.properties。" +
+            "恢复仓库外 `.dshwork/staging/.secrets/heracles-release.jks` 与 properties 后再构建。"
+    )
+}
+val heraclesKeyProps = Properties().apply {
+    if (heraclesHasReleaseKey) {
+        heraclesKeyPropsFile.inputStream().use { load(it) }
+    }
+}
+/** 把 properties 里的相对路径按 `rootProject`（= app/android）解析。 */
+fun heraclesStoreFile(): File {
+    val raw = heraclesKeyProps.getProperty("storeFile") ?: ""
+    val f = File(raw)
+    return if (f.isAbsolute) f else rootProject.file(raw)
 }
 
 android {
@@ -99,11 +158,34 @@ android {
         }
     }
 
+    // ⚠️ 顺序有意义：`signingConfigs` 必须在 `buildTypes` **之前**声明，
+    //    否则 `signingConfigs.getByName("release")` 在配置期拿不到
+    //    （实测报 `SigningConfig with name 'release' not found`）。
+    signingConfigs {
+        if (heraclesHasReleaseKey) {
+            create("release") {
+                storeFile = heraclesStoreFile()
+                storePassword = heraclesKeyProps.getProperty("storePassword")
+                keyAlias = heraclesKeyProps.getProperty("keyAlias")
+                keyPassword = heraclesKeyProps.getProperty("keyPassword")
+                // v1/v2/v3 都开：v3 便于后续换密钥轮换，v1 兼容极老设备。
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // ★ 用户裁定：release 必须始终用正式密钥；禁止静默回退 debug。
+            signingConfig = if (heraclesHasReleaseKey) {
+                signingConfigs.getByName("release")
+            } else {
+                // Debug / test tasks may configure all variants eagerly; the top-level
+                // guard above already hard-fails any requested release task.
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }

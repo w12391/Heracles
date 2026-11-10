@@ -11,6 +11,8 @@ import '../theme/cupertino_kit.dart';
 import '../theme/pressable.dart';
 import 'jev_local_settings_screen.dart';
 
+import 'package:heracles/i18n/l10n.dart';
+
 // ---------------------------------------------------------------------------
 // 决策请求诊断展示（消费后端 B8 的 JevDiagnostics / JevDecisionResult）
 //
@@ -174,7 +176,7 @@ String jevOutcomeHeadline(JevTestReport r) {
     final res = r.result!;
     final pct = (res.confidence * 100).toStringAsFixed(0);
     final sec = (res.diagnostics.elapsedMs / 1000).toStringAsFixed(1);
-    return '连接成功：决策服务返回「${res.recommended ? '是' : '否'}」，'
+    return '连接成功：决策服务返回「${res.recommended ? tr('是') : '否'}」，'
         '置信度 $pct% · 耗时 $sec 秒';
   }
   final d = r.diagnostics;
@@ -191,7 +193,7 @@ String jevOutcomeHeadline(JevTestReport r) {
   final reason = r.failureMessage?.trim() ?? '';
   if (status == null) {
     if (label.isNotEmpty) return '连接失败：$label';
-    return reason.isEmpty ? '连接失败' : '连接失败：$reason';
+    return reason.isEmpty ? tr('连接失败') : '连接失败：$reason';
   }
   final head = '连接失败（HTTP $status）';
   return label.isEmpty ? head : '$head：$label';
@@ -204,7 +206,7 @@ List<String> jevDiagnosticLines(JevTestReport r) {
   if (d == null) {
     return [
       '请求 URL：${r.endpoint.trim().isEmpty ? '—' : r.endpoint}',
-      'HTTP 码：—（请求没有发出：${r.failureMessage ?? '本地前置检查未通过'}）',
+      'HTTP 码：—（请求没有发出：${r.failureMessage ?? tr('本地前置检查未通过')}）',
       'traceId：（无）',
     ];
   }
@@ -218,7 +220,7 @@ List<String> jevDiagnosticLines(JevTestReport r) {
     '耗时：${(d.elapsedMs / 1000).toStringAsFixed(1)} 秒',
     'code：${d.serverCode ?? '—'}',
     'message：${d.serverMessage ?? '—'}',
-    'traceId：${d.traceId ?? '（无）'}',
+    'traceId：${d.traceId ?? tr('（无）')}',
   ];
 }
 
@@ -367,7 +369,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
     // refreshCloudKey 内部会通知监听者）
     await jev.refreshCloudKey();
     if (!mounted) return;
-    showIosToast(context, '已保存');
+    showIosToast(context, tr('已保存'));
   }
 
   /// 拉取模型目录（GET /v1/models 口径，见 JevCloudClient）——
@@ -426,7 +428,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
     final resolution = JevCloudClient.resolveEndpoint(baseUrl);
     if (baseUrl.isEmpty) {
       setState(() {
-        _preflightError = resolution.hint ?? '先填接口地址';
+        _preflightError = resolution.hint ?? tr('先填接口地址');
         _report = null;
       });
       return;
@@ -491,7 +493,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
   Future<void> _copyReport(JevTestReport report) async {
     await Clipboard.setData(ClipboardData(text: jevDiagnosticsText(report)));
     if (!mounted) return;
-    showIosToast(context, '详情已复制');
+    showIosToast(context, tr('详情已复制'));
   }
 
   @override
@@ -500,7 +502,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
     return Scaffold(
       backgroundColor: h.bg,
       appBar: AppBar(
-        title: const Text('JEV 决策引擎'),
+        title: Text(tr('JEV 决策引擎')),
         leading: IconButton(
           icon: const Icon(AppIcons.back, size: 21),
           onPressed: () => Navigator.of(context).pop(),
@@ -511,7 +513,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
             minimumSize: const Size(0, 44),
             padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
             foregroundColor: h.accent,
-            child: const Text('保存'),
+            child: Text(tr('保存')),
           ),
           const SizedBox(width: HSpace.sm),
         ],
@@ -531,28 +533,26 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
               // 获取模型 + 测试连接 + 理由开关），本地的一切收进
               // 下方「本地配置」入口页。引擎来源不在本页 —— 在
               // 决策页输入框左下角的来源胶囊里点按切换。
-              Text(
-                '引擎来源（云端 / 本地）在决策页输入框左下角点按切换；'
-                '这里编辑云端接口，本地模型与本机检测在下方「本地配置」里。',
+              Text(tr('引擎来源（云端 / 本地）在决策页输入框左下角点按切换；'
+                '这里编辑云端接口，本地模型与本机检测在下方「本地配置」里。'),
                 style: TextStyle(fontSize: 13, color: h.textFaint, height: 1.5),
               ),
               const SizedBox(height: HSpace.lg),
-              _groupLabel(h, '云端'),
+              _groupLabel(h, tr('云端')),
               _field(
                 h,
                 '接口地址',
                 _urlCtrl,
                 fieldKey: const ValueKey('jev-url-field'),
-                hint: '预置基元律动：https://tokenrhythm.studio/v1/decision',
+                hint: tr('预置基元律动：https://tokenrhythm.studio/v1/decision'),
               ),
               const SizedBox(height: HSpace.xs),
               // ★ 用户 2026-10-29：地址框下方**实时**显示实际请求端点，
               // 值一律来自 JevCloudClient.resolveEndpoint（页面不自己拼）。
               _endpointPreview(h),
               const SizedBox(height: HSpace.xs),
-              Text(
-                '两种填法：① 完整端点 https://tokenrhythm.studio/v1/decision；'
-                '② 只填到 https://tokenrhythm.studio/v1，应用自动补 /decision。',
+              Text(tr('两种填法：① 完整端点 https://tokenrhythm.studio/v1/decision；'
+                '② 只填到 https://tokenrhythm.studio/v1，应用自动补 /decision。'),
                 style: HTxt.caption.copyWith(color: h.textFaint, height: 1.5),
               ),
               const SizedBox(height: HSpace.md),
@@ -561,7 +561,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
                 'API 密钥',
                 _keyCtrl,
                 fieldKey: const ValueKey('jev-key-field'),
-                hint: '平台密钥，sk_ 开头',
+                hint: tr('平台密钥，sk_ 开头'),
                 obscure: _obscureKey,
                 trailing: CupertinoButton(
                   padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
@@ -580,7 +580,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
                 '模型',
                 _modelCtrl,
                 fieldKey: const ValueKey('jev-model-field'),
-                hint: '基元律动固定 NeoHorse-Jev-4B',
+                hint: tr('基元律动固定 NeoHorse-Jev-4B'),
               ),
               // ★ 模型字段不是固定 ID 时黄字提示；B8 报告 modelCorrected
               // 时再显示「已按固定 ID 发送」。
@@ -589,7 +589,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
               // ---- 获取模型（与提供商编辑页同款：标签 + 右侧轻量入口）----
               Row(
                 children: [
-                  Text('模型目录',
+                  Text(tr('模型目录'),
                       style: TextStyle(fontSize: 13, color: h.textDim)),
                   const Spacer(),
                   IosTap(
@@ -600,7 +600,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
                       child: _loadingModels
                           ? CupertinoActivityIndicator(
                               radius: 6, color: h.accent)
-                          : Text('获取可用模型',
+                          : Text(tr('获取可用模型'),
                               style:
                                   TextStyle(fontSize: 12, color: h.accent)),
                     ),
@@ -656,7 +656,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
                   SizedBox(
                     width: 140,
                     child: IosButton(
-                      label: _testing ? '测试中…' : '测试连接',
+                      label: _testing ? tr('测试中…') : '测试连接',
                       filled: false,
                       color: h.accent,
                       busy: _testing,
@@ -682,18 +682,16 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
                 ],
               ),
               const SizedBox(height: HSpace.sm),
-              Text(
-                '改完点右上角「保存」；获取模型与测试连接用的是框里'
-                '当前填的值，不用先保存。',
+              Text(tr('改完点右上角「保存」；获取模型与测试连接用的是框里'
+                '当前填的值，不用先保存。'),
                 style: HTxt.caption.copyWith(color: h.textFaint, height: 1.55),
               ),
               const SizedBox(height: HSpace.sm),
-              Text(
-                '理由生成暂不支持（后续版本提供）：决策只给结论与概率。',
+              Text(tr('理由生成暂不支持（后续版本提供）：决策只给结论与概率。'),
                 style: HTxt.caption.copyWith(color: h.textFaint, height: 1.55),
               ),
               const SizedBox(height: HSpace.lg),
-              _groupLabel(h, '本地'),
+              _groupLabel(h, tr('本地')),
               _localEntry(h),
             ],
           );
@@ -710,7 +708,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
     final raw = _urlCtrl.text.trim();
     final resolution = JevCloudClient.resolveEndpoint(raw);
     final text = raw.isEmpty
-        ? '将请求：POST （先填接口地址）'
+        ? tr('将请求：POST （先填接口地址）')
         : '将请求：POST ${resolution.url}';
     final hint = resolution.hint?.trim();
     return Column(
@@ -758,8 +756,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
             ),
           if (corrected) ...[
             if (wrong) const SizedBox(height: 2),
-            Text(
-              '已按固定 ID 发送',
+            Text(tr('已按固定 ID 发送'),
               key: const ValueKey('jev-model-corrected'),
               style: TextStyle(fontSize: 12, height: 1.45, color: warn),
             ),
@@ -806,7 +803,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
           if (d != null) ...[
             const SizedBox(height: 4),
             Text(
-              'traceId：${d.traceId ?? '（无）'}',
+              'traceId：${d.traceId ?? tr('（无）')}',
               key: const ValueKey('jev-outcome-trace'),
               style: TextStyle(fontSize: 12, height: 1.4, color: h.textFaint),
             ),
@@ -841,7 +838,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
               IosTap(
                 onTap: () => setState(() => _diagExpanded = !_diagExpanded),
                 child: Text(
-                  _diagExpanded ? '收起' : '详情',
+                  _diagExpanded ? tr('收起') : '详情',
                   key: const ValueKey('jev-detail-toggle'),
                   style: TextStyle(fontSize: 12, color: h.accent),
                 ),
@@ -849,8 +846,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
               const SizedBox(width: HSpace.lg),
               IosTap(
                 onTap: () => unawaited(_copyReport(report)),
-                child: Text(
-                  '复制详情',
+                child: Text(tr('复制详情'),
                   key: const ValueKey('jev-copy-details'),
                   style: TextStyle(fontSize: 12, color: h.accent),
                 ),
@@ -885,8 +881,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
   Widget _rawBodyBlock(Hue h, JevDiagnostics? d) {
     final body = d?.rawBody ?? '';
     if (body.trim().isEmpty) {
-      return Text(
-        '原始响应体：（无）',
+      return Text(tr('原始响应体：（无）'),
         key: const ValueKey('jev-raw-body-empty'),
         style: TextStyle(fontSize: 12, height: 1.4, color: h.textDim),
       );
@@ -895,8 +890,7 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          '原始响应体：',
+        Text(tr('原始响应体：'),
           style: TextStyle(fontSize: 12, height: 1.4, color: h.textDim),
         ),
         if (truncated)
@@ -984,15 +978,14 @@ class _JevSettingsScreenState extends State<JevSettingsScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      '本地配置',
+                    Text(tr('本地配置'),
                       style: HTxt.body.copyWith(fontWeight: FontWeight.w600),
                     ),
                     const SizedBox(height: 1),
                     Text(
                       downloaded > 0
                           ? '本机检测 · 已下载 $downloaded 个本地模型'
-                          : '本机检测 · 本地模型下载与管理',
+                          : tr('本机检测 · 本地模型下载与管理'),
                       style: HTxt.caption.copyWith(color: h.textFaint),
                     ),
                   ],

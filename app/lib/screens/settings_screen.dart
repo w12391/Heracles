@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'package:heracles/i18n/l10n.dart';
+
 import '../models/jev.dart';
 import '../models/settings.dart';
 import '../services/agent_bridge.dart';
@@ -60,7 +62,7 @@ class SettingsScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('设置'),
+        title: Text(tr('设置')),
         leading: _iosBackLeading(context),
       ),
       body: ValueListenableBuilder<AppSettings>(
@@ -75,18 +77,18 @@ class SettingsScreen extends StatelessWidget {
               //   2026-10-25 的「一项一卡」。行内仍是标题 + 副行
               //   状态值 + 右箭头（状态值不放右侧：长模型名会把
               //   标题挤成竖排，真机翻过车）。
-              const _SectionLabel('通用'),
+              _SectionLabel(tr('通用')),
               _GroupCard(
                 children: [
                   _HomeRow(
-                    title: '通用设置',
-                    subtitle: '界面字号 · 工作步骤 · 繁忙发送 · 最大轮次',
+                    title: tr('通用设置'),
+                    subtitle: tr('界面字号 · 工作步骤 · 繁忙发送 · 最大轮次'),
                     onTap: () => _push(
                         context, GeneralSettingsPage(controller: controller)),
                   ),
                 ],
               ),
-              const _SectionLabel('智能体'),
+              _SectionLabel(tr('智能体')),
               _GroupCard(
                 children: [
                   _GlobalMemoryEntry(
@@ -110,13 +112,13 @@ class SettingsScreen extends StatelessWidget {
                   ),
                   // ★ 2026-11-03：搜索服务 / 机器人接入（本轮新增能力）
                   _HomeRow(
-                    title: '搜索服务',
-                    subtitle: 'endpoint 配置 · 仅免鉴权',
+                    title: tr('搜索服务'),
+                    subtitle: tr('endpoint 配置 · 仅免鉴权'),
                     onTap: () => _push(context, const SearchSettingsScreen()),
                   ),
                   _HomeRow(
-                    title: '机器人接入',
-                    subtitle: '飞书 · QQ(OneBot) · 微信官方',
+                    title: tr('机器人接入'),
+                    subtitle: tr('飞书 · QQ(OneBot) · 微信官方'),
                     onTap: () => _push(context, const RobotAccessScreen()),
                   ),
                   // ★ 2026-11-02：技能 / MCP / 自动化三行**移出设置页**
@@ -128,7 +130,7 @@ class SettingsScreen extends StatelessWidget {
                       onOpen: onOpenArchived!,
                     ),
                   _HomeRow(
-                    title: '模型',
+                    title: tr('模型'),
                     // 与聊天页同源同字段（2026-10-15 修 BUG-5 的口径保留）：
                     // effectiveProvider + 「服务商 · 模型名」
                     // ★ 2026-11-08：副行末尾带上**当前生效的上下文窗口**。
@@ -136,7 +138,7 @@ class SettingsScreen extends StatelessWidget {
                     //   provider 条目**上，当前这条是 0（按默认 128K）。副行里
                     //   直接写出来，就不会再靠猜。
                     subtitle: s.effectiveProvider == null
-                        ? '未选择'
+                        ? tr('未选择')
                         : '${s.effectiveProvider!.model.isEmpty ? s.effectiveProvider!.name : '${s.effectiveProvider!.name} · ${s.effectiveProvider!.model}'}'
                             ' · 窗口 ${s.effectiveProvider!.effectiveContextWindow > 0 ? formatTokenCount(s.effectiveProvider!.effectiveContextWindow) : '未设置(默认128K)'}',
                     onTap: () => _push(
@@ -146,22 +148,22 @@ class SettingsScreen extends StatelessWidget {
               ),
               // ★ JEV 入口已按用户要求（2026-10-28）搬进「模型」页，
               // 与提供商卡并列、点「编辑」进入 —— 设置主页不再单列。
-              const _SectionLabel('应用'),
+              _SectionLabel(tr('应用')),
               _GroupCard(
                 children: [
                   _HomeRow(
-                    title: '外观',
+                    title: tr('外观'),
                     subtitle: s.appearance.label,
                     onTap: () => _push(
                         context, AppearanceSettingsPage(controller: controller)),
                   ),
                   _HomeRow(
-                    title: '关于 Heracles',
-                    subtitle: 'Dart 内核',
+                    title: tr('关于 Heracles'),
+                    subtitle: tr('Dart 内核'),
                     onTap: () => _push(context, const AboutPage()),
                   ),
                   _HomeRow(
-                    title: '开源许可',
+                    title: tr('开源许可'),
                     subtitle: '${kOssEntries.length} 个开源项目 · 谨此致谢',
                     onTap: () => _push(context, const OssLicensesScreen()),
                   ),
@@ -244,15 +246,15 @@ class _DevicePermissionEntryState extends State<_DevicePermissionEntry> {
 
   String get _badge {
     final n = _deniedCount;
-    if (n != null) return n == 0 ? '全部开启' : '$n 项未开启';
+    if (n != null) return n == 0 ? tr('全部开启') : '$n 项未开启';
     if (_granted == null) return '…';
-    return _granted! ? '已授权' : '未授权';
+    return _granted! ? tr('已授权') : '未授权';
   }
 
   @override
   Widget build(BuildContext context) {
     return _HomeRow(
-      title: '设备权限',
+      title: tr('设备权限'),
       // 状态作卡片副行 —— 不进二级页也知道几项没开
       subtitle: _badge,
       onTap: () async {
@@ -307,7 +309,7 @@ class _VoiceEntryState extends State<_VoiceEntry> {
   @override
   Widget build(BuildContext context) {
     return _HomeRow(
-      title: '语音识别',
+      title: tr('语音识别'),
       subtitle: _badge,
       onTap: () async {
         widget.onOpen();
@@ -335,15 +337,14 @@ class BackgroundKeepalivePage extends StatelessWidget {
     final h = Hue.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('后台运行'),
+        title: Text(tr('后台运行')),
         leading: _iosBackLeading(context),
       ),
       body: ListView(
         padding: const EdgeInsets.all(HSpace.lg),
         children: [
-          Text(
-            '长任务在后台继续跑需要的系统设置。Android 不保证永不被杀；'
-            '这里只显示真实状态与引导，不假装“开了就一直跑”。',
+          Text(tr('长任务在后台继续跑需要的系统设置。Android 不保证永不被杀；'
+            '这里只显示真实状态与引导，不假装“开了就一直跑”。'),
             style: TextStyle(fontSize: 12.5, height: 1.55, color: h.textFaint),
           ),
           const SizedBox(height: HSpace.md),
@@ -549,7 +550,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
         case ('allFiles', 'denied'):
           return pill('未开启 · 按设计', false);
         case ('allFiles', _):
-          return pill(v == 'granted' ? '已授权' : '未知', v == 'granted');
+          return pill(v == 'granted' ? tr('已授权') : '未知', v == 'granted');
         case ('media', _):
           return runtimePerm('图片与视频');
         case ('camera', _):
@@ -566,7 +567,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
           // 按用户定：未知来源安装在「点安装」时才申请，权限页
           // 只显示状态（已开启 / 安装时申请）。
           return pill(
-              v == 'granted' ? '已开启' : '安装时申请', v == 'granted');
+              v == 'granted' ? tr('已开启') : '安装时申请', v == 'granted');
         case ('shizuku', 'unknown'):
           return pill('未启动', false);
         case ('shizuku', _):
@@ -579,7 +580,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                     if (want) {
                       unawaited(_runShizuku(force: false));
                     } else {
-                      showIosToast(context, '关闭授权请在 Shizuku 应用里操作');
+                      showIosToast(context, tr('关闭授权请在 Shizuku 应用里操作'));
                     }
                   },
           );
@@ -618,8 +619,8 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
           KeyedSubtree(
             key: const Key('device-permission-background-row'),
             child: _HomeRow(
-              title: '后台运行',
-              subtitle: '保活状态 · 电池优化 · 自启动',
+              title: tr('后台运行'),
+              subtitle: tr('保活状态 · 电池优化 · 自启动'),
               onTap: () => Navigator.of(context).push(
                 CupertinoPageRoute(
                   builder: (_) => const BackgroundKeepalivePage(),
@@ -670,15 +671,15 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
       final r = await AgentBridge().requestPermissionDetailed(kind);
       if (!mounted) return;
       if (!r.ok) {
-        showIosToast(context, r.error ?? '没能打开系统授权界面');
+        showIosToast(context, r.error ?? tr('没能打开系统授权界面'));
         return;
       }
       if (r.action == PermissionAction.settingsOpened) {
         // 系统不再弹授权框（永久拒绝/通知总开关关闭等）—— 已把用户送到设置页，
         // 回来重查才是权威；这里明确告诉用户接下来要做什么。
-        showIosToast(context, '系统不再弹授权框，已打开设置页；请在那里开启');
+        showIosToast(context, tr('系统不再弹授权框，已打开设置页；请在那里开启'));
       } else if (r.action == PermissionAction.alreadyGranted) {
-        showIosToast(context, '该权限已经开启');
+        showIosToast(context, tr('该权限已经开启'));
       }
       await Future<void>.delayed(const Duration(milliseconds: 700));
       if (mounted) await _refresh();
@@ -744,7 +745,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
     final h = Hue.of(context);
     return Scaffold(
       appBar: AppBar(
-          title: const Text('设备权限'), leading: _iosBackLeading(context)),
+          title: Text(tr('设备权限')), leading: _iosBackLeading(context)),
       body: _loading
           ? Center(child: CupertinoActivityIndicator(color: h.accent))
           : ListView(
@@ -761,8 +762,8 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                       KeyedSubtree(
                         key: const Key('device-permission-background-row'),
                         child: _HomeRow(
-                          title: '后台运行',
-                          subtitle: '保活状态 · 电池优化 · 自启动',
+                          title: tr('后台运行'),
+                          subtitle: tr('保活状态 · 电池优化 · 自启动'),
                           onTap: () => Navigator.of(context).push(
                             CupertinoPageRoute(
                               builder: (_) => const BackgroundKeepalivePage(),
@@ -777,7 +778,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                 Text(
                   [
                     if (_granted != null)
-                      '无障碍自愈${_granted == true ? '可用' : '不可用'}',
+                      '无障碍自愈${_granted == true ? tr('可用') : '不可用'}',
                     '权限只在你主动开启后生效；关闭任意一项，对应工具会立即不可用并说明原因。',
                   ].join(' · '),
                   style: TextStyle(
@@ -786,16 +787,14 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                 // ---- 未授权：授权引导（方式说明 + 一键授权）----
                 if (_granted == false && _guidance.isNotEmpty) ...[
                   const SizedBox(height: HSpace.lg),
-                  Text(
-                    '授权引导',
+                  Text(tr('授权引导'),
                     style: TextStyle(
                         fontSize: 13,
                         fontWeight: FontWeight.w600,
                         color: h.text),
                   ),
                   const SizedBox(height: HSpace.xs),
-                  Text(
-                    '三种授权方式任选其一：',
+                  Text(tr('三种授权方式任选其一：'),
                     style: TextStyle(fontSize: 12.5, color: h.textDim),
                   ),
                   const SizedBox(height: HSpace.sm),
@@ -822,7 +821,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                   SizedBox(
                     width: double.infinity,
                     child: IosButton(
-                      label: '通过 Shizuku 一键授权',
+                      label: tr('通过 Shizuku 一键授权'),
                       color: h.accent,
                       busy: _shizukuBusy,
                       onPressed: _shizukuBusy
@@ -835,7 +834,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                   SizedBox(
                     width: double.infinity,
                     child: IosButton(
-                      label: '我已执行授权，刷新状态',
+                      label: tr('我已执行授权，刷新状态'),
                       filled: false,
                       color: h.accent,
                       onPressed: _refresh,
@@ -843,8 +842,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                   ),
                 ] else if (_granted == true) ...[
                   const SizedBox(height: HSpace.md),
-                  Text(
-                    '一切正常 —— 无障碍被系统关闭时会自动恢复，无需干预。',
+                  Text(tr('一切正常 —— 无障碍被系统关闭时会自动恢复，无需干预。'),
                     style: TextStyle(
                         fontSize: 12.5, height: 1.5, color: h.textDim),
                   ),
@@ -859,8 +857,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                           : () => _runShizuku(force: true),
                       minimumSize: const Size(0, 36),
                       padding: EdgeInsets.zero,
-                      child: Text(
-                        '重新向 Shizuku 申请授权（收录本 App）',
+                      child: Text(tr('重新向 Shizuku 申请授权（收录本 App）'),
                         style: TextStyle(fontSize: 13, color: h.textDim),
                       ),
                     ),
@@ -874,8 +871,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                   behavior: HitTestBehavior.opaque,
                   child: Row(
                     children: [
-                      Text(
-                        '诊断与自检',
+                      Text(tr('诊断与自检'),
                         style: TextStyle(
                             fontSize: 13,
                             fontWeight: FontWeight.w600,
@@ -883,7 +879,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                       ),
                       const Spacer(),
                       Text(
-                        _diagExpanded ? '收起' : '详情',
+                        _diagExpanded ? tr('收起') : '详情',
                         style: TextStyle(fontSize: 12.5, color: h.textDim),
                       ),
                       Icon(
@@ -915,11 +911,11 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                         children: [
                           Row(
                             children: [
-                              Text('当前执行路由：',
+                              Text(tr('当前执行路由：'),
                                   style: TextStyle(
                                       fontSize: 12.5, color: h.textDim)),
                               Text(
-                                (_diag['route'] as String?) ?? '无',
+                                (_diag['route'] as String?) ?? tr('无'),
                                 style: TextStyle(
                                   fontSize: 13,
                                   fontWeight: FontWeight.w700,
@@ -940,7 +936,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                             _diagText(
                               h,
                               (_diag['stellarRoot'] == true)
-                                  ? 'Stellar 模式：Root（能力最强）'
+                                  ? tr('Stellar 模式：Root（能力最强）')
                                   : 'Stellar 模式：ADB / Shell（uid=${_diag['stellarUid']}）',
                             ),
                           const SizedBox(height: HSpace.xs),
@@ -959,17 +955,15 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                   // 编码层自检：能不能跑通直接取决于上面的执行路由
                   //（App 自己没有 shell 身份，工具链全靠它跑）。
                   const SizedBox(height: HSpace.lg),
-                  Text(
-                    '编码层自检',
+                  Text(tr('编码层自检'),
                     style: TextStyle(
                         fontSize: 13,
                         fontWeight: FontWeight.w600,
                         color: h.text),
                   ),
                   const SizedBox(height: HSpace.xs),
-                  Text(
-                    '在手机上真跑一遍：起前台服务 → 读温度/电量 → 定位工具链 → '
-                    '建 Hello World → 构建 → 拆包核对。',
+                  Text(tr('在手机上真跑一遍：起前台服务 → 读温度/电量 → 定位工具链 → '
+                    '建 Hello World → 构建 → 拆包核对。'),
                     style:
                         TextStyle(fontSize: 12, height: 1.5, color: h.textDim),
                   ),
@@ -977,7 +971,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                   SizedBox(
                     width: double.infinity,
                     child: IosButton(
-                      label: '跑一遍编码层自检',
+                      label: tr('跑一遍编码层自检'),
                       color: h.accent,
                       busy: _selfCheckBusy,
                       onPressed: _selfCheckBusy
@@ -999,7 +993,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                   if (_selfCheckBusy)
                     Padding(
                       padding: const EdgeInsets.only(top: HSpace.xs),
-                      child: Text('构建要 1–3 分钟，期间请不要切走应用…',
+                      child: Text(tr('构建要 1–3 分钟，期间请不要切走应用…'),
                           style: TextStyle(fontSize: 12, color: h.textDim)),
                     ),
                   if (_selfCheckMsg != null) ...[
@@ -1048,7 +1042,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
                 style: TextStyle(fontSize: 12, color: h.textDim)),
           ),
           Text(
-            ok ? '是' : '否',
+            ok ? tr('是') : '否',
             style: TextStyle(
               fontSize: 12,
               fontFamily: kMonoFontFamily,
@@ -1072,7 +1066,7 @@ class _DevicePermissionPageState extends State<DevicePermissionPage>
   ///
   /// 用户真正想知道的是"我现在到底能用什么、不能用什么、为什么"。
   String _diagConclusion() {
-    final route = (_diag['route'] as String?) ?? '无';
+    final route = (_diag['route'] as String?) ?? tr('无');
     final stellarGranted = _diag['stellarGranted'] == true;
     final anyInstalled = _diag['stellarInstalled'] == true ||
         _diag['shizukuInstalled'] == true;
@@ -1144,10 +1138,10 @@ class _SandboxEntryState extends State<_SandboxEntry> {
   @override
   Widget build(BuildContext context) {
     return _HomeRow(
-      title: '沙箱',
+      title: tr('沙箱'),
       subtitle: _installed == null
-          ? '内置 Linux 环境'
-          : (_installed! ? '内置 Linux 环境 · 已激活' : '内置 Linux 环境 · 未激活'),
+          ? tr('内置 Linux 环境')
+          : (_installed! ? tr('内置 Linux 环境 · 已激活') : '内置 Linux 环境 · 未激活'),
       onTap: () async {
         await widget.onOpen();
         if (mounted) _refresh();
@@ -1179,13 +1173,13 @@ class _ArchivedEntryState extends State<_ArchivedEntry> {
 
   void _reload() {
     final n = widget.countOf();
-    setState(() => _badge = n == 0 ? '暂无' : '$n 个');
+    setState(() => _badge = n == 0 ? tr('暂无') : '$n 个');
   }
 
   @override
   Widget build(BuildContext context) {
     return _HomeRow(
-      title: '已归档对话',
+      title: tr('已归档对话'),
       subtitle: _badge ?? '…',
       onTap: () async {
         await widget.onOpen();
@@ -1434,7 +1428,7 @@ class BridgeMemoryDataSource implements MemoryDataSource {
         await const GlobalMemory().addEntry(text, kind: kind, source: 'user');
     return r.ok
         ? const MemoryWriteOutcome.ok()
-        : MemoryWriteOutcome.failure(r.error ?? '保存失败');
+        : MemoryWriteOutcome.failure(r.error ?? tr('保存失败'));
   }
 
   @override
@@ -1446,7 +1440,7 @@ class BridgeMemoryDataSource implements MemoryDataSource {
     final r = await const GlobalMemory().updateEntry(id, text);
     return r.ok
         ? const MemoryWriteOutcome.ok()
-        : MemoryWriteOutcome.failure(r.error ?? '保存失败');
+        : MemoryWriteOutcome.failure(r.error ?? tr('保存失败'));
   }
 
   @override
@@ -1457,7 +1451,7 @@ class BridgeMemoryDataSource implements MemoryDataSource {
     final r = await const GlobalMemory().deleteEntry(id);
     return r.ok
         ? const MemoryWriteOutcome.ok()
-        : MemoryWriteOutcome.failure(r.error ?? '删除失败');
+        : MemoryWriteOutcome.failure(r.error ?? tr('删除失败'));
   }
 
   @override
@@ -1520,10 +1514,10 @@ class _GlobalMemoryEntryState extends State<_GlobalMemoryEntry> {
       final gn = g.entries.length;
       final wn = w.entries.length;
       if (w.status == MemoryLoadStatus.ok) {
-        _badge = gn == 0 && wn == 0 ? '暂无记忆' : '全局 $gn · 本工作区 $wn';
+        _badge = gn == 0 && wn == 0 ? tr('暂无记忆') : '全局 $gn · 本工作区 $wn';
       } else {
         // 工作区还没接入（B1 未交付）⇒ 只报全局，不画一个假的本工作区数
-        _badge = gn == 0 ? '暂无记忆' : '全局 $gn';
+        _badge = gn == 0 ? tr('暂无记忆') : '全局 $gn';
       }
     });
   }
@@ -1532,7 +1526,7 @@ class _GlobalMemoryEntryState extends State<_GlobalMemoryEntry> {
   Widget build(BuildContext context) {
     return _HomeRow(
       key: const ValueKey('memory_home_row'),
-      title: '全局记忆',
+      title: tr('全局记忆'),
       // 规模作卡片副行 —— 不进二级页也知道记了多少
       subtitle: _badge ?? '…',
       onTap: () async {
@@ -1713,7 +1707,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
         MemoryScopeView.session => '这个会话的私有记忆会被删除'
             '（工作区 / 全局不受影响），无法恢复。',
       },
-      confirmLabel: '清空记忆',
+      confirmLabel: tr('清空记忆'),
       destructive: true,
     );
     if (!ok || !mounted) return;
@@ -1722,21 +1716,21 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
     if (!mounted) return;
     setState(() => _busy = false);
     if (!r.ok) {
-      showIosToast(context, r.error ?? '清空失败');
+      showIosToast(context, r.error ?? tr('清空失败'));
       return;
     }
     await _load();
     if (!mounted) return;
-    showIosToast(context, '已清空');
+    showIosToast(context, tr('已清空'));
   }
 
   Future<void> _confirmDelete(
       MemoryScopeView scope, MemoryScopeEntry e) async {
     final ok = await showBwConfirmSheet(
       context,
-      title: '删除这条记忆？',
+      title: tr('删除这条记忆？'),
       message: e.text.length > 80 ? '${e.text.substring(0, 80)}…' : e.text,
-      confirmLabel: '删除',
+      confirmLabel: tr('删除'),
       destructive: true,
     );
     if (!ok || !mounted) return;
@@ -1745,7 +1739,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
     if (!mounted) return;
     setState(() => _busy = false);
     if (!r.ok) {
-      showIosToast(context, r.error ?? '删除失败');
+      showIosToast(context, r.error ?? tr('删除失败'));
       return;
     }
     await _load();
@@ -1772,7 +1766,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
     if (saved == true) {
       await _load();
       if (!mounted) return;
-      showIosToast(context, entry == null ? '已添加' : '已保存');
+      showIosToast(context, entry == null ? tr('已添加') : '已保存');
     }
   }
 
@@ -1784,12 +1778,12 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
     if (!mounted) return;
     setState(() => _busy = false);
     if (!r.ok) {
-      showIosToast(context, r.error ?? (promote ? '晋升失败' : '操作失败'));
+      showIosToast(context, r.error ?? (promote ? tr('晋升失败') : '操作失败'));
       return;
     }
     await _load();
     if (!mounted) return;
-    showIosToast(context, promote ? '已晋升为全局记忆' : '已忽略');
+    showIosToast(context, promote ? tr('已晋升为全局记忆') : '已忽略');
   }
 
   // ------------------------------------------------------------ 容量：两组数字
@@ -1838,8 +1832,8 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
     }
 
     final storageNote = anySoftBudget
-        ? '软预算：满了会淘汰最旧条目，不会拒绝新增'
-        : '软预算：B1 接入后按「满了淘汰最旧条目、不拒写」执行';
+        ? tr('软预算：满了会淘汰最旧条目，不会拒绝新增')
+        : tr('软预算：B1 接入后按「满了淘汰最旧条目、不拒写」执行');
 
     final injection = <Widget>[];
     if (budget != null && budget.status == MemoryLoadStatus.ok) {
@@ -1850,16 +1844,16 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
         Text('每轮最多 ${budget.sessionInjectChars} 字符（本会话）',
             style: TextStyle(fontSize: 12.5, color: h.textDim)),
         const SizedBox(height: 6),
-        Text('按任务检索后注入；没命中的条目压成摘要',
+        Text(tr('按任务检索后注入；没命中的条目压成摘要'),
             style: TextStyle(fontSize: 11.5, height: 1.5, color: h.textFaint)),
         if (!budget.fromHost) ...[
           const SizedBox(height: 4),
-          Text('上限为契约默认值（§N12.8），B1 接入后以宿主回报为准',
+          Text(tr('上限为契约默认值（§N12.8），B1 接入后以宿主回报为准'),
               style: TextStyle(fontSize: 11.5, height: 1.5, color: h.textFaint)),
         ],
       ]);
     } else {
-      injection.add(Text(budget?.message ?? '待后端 B1 接入',
+      injection.add(Text(budget?.message ?? tr('待后端 B1 接入'),
           style: TextStyle(fontSize: 12.5, height: 1.5, color: h.textFaint)));
     }
 
@@ -1874,7 +1868,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('存储软预算',
+          Text(tr('存储软预算'),
               style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -1887,7 +1881,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
           const SizedBox(height: 14),
           Divider(height: 1, color: h.border),
           const SizedBox(height: 14),
-          Text('注入预算',
+          Text(tr('注入预算'),
               style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -1947,14 +1941,14 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
             if (ok && count > 0)
               _scopeAction(
                 key: ValueKey('memory_clear_${scope.name}'),
-                label: '清空',
+                label: tr('清空'),
                 color: HColors.errorOn(h.dark),
                 onTap: _busy ? null : () => _confirmClear(scope),
               ),
             if (ok)
               _scopeAction(
                 key: ValueKey('memory_add_${scope.name}'),
-                label: '添加',
+                label: tr('添加'),
                 color: h.textDim,
                 onTap: _busy ? null : () => _openEditor(scope: scope),
               ),
@@ -1980,7 +1974,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
       case MemoryLoadStatus.error:
         // ★ 读失败 ≠ 暂无记忆：显式说"读取失败"并给重试，绝不画成空
         return [
-          Text('读取失败',
+          Text(tr('读取失败'),
               style: TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.w600,
@@ -1993,14 +1987,14 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
           const SizedBox(height: 6),
           _scopeAction(
             key: ValueKey('memory_retry_${scope.name}'),
-            label: '重试',
+            label: tr('重试'),
             color: h.text,
             onTap: _busy ? null : () => _load(),
           ),
         ];
       case MemoryLoadStatus.unavailable:
         return [
-          Text(snap.message ?? '后端 B1 接入中',
+          Text(snap.message ?? tr('后端 B1 接入中'),
               style:
                   TextStyle(fontSize: 13, height: 1.55, color: h.textFaint)),
         ];
@@ -2009,7 +2003,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
           return [
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 10),
-              child: Text('暂无记忆',
+              child: Text(tr('暂无记忆'),
                   style: TextStyle(fontSize: 12.5, color: h.textFaint)),
             ),
           ];
@@ -2048,7 +2042,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
                   fontWeight: FontWeight.w600,
                   color: h.text)),
           const SizedBox(height: 4),
-          Text('模型提议的全局记忆，只有你确认后才会对所有会话生效',
+          Text(tr('模型提议的全局记忆，只有你确认后才会对所有会话生效'),
               style:
                   TextStyle(fontSize: 11.5, height: 1.5, color: h.textFaint)),
           const SizedBox(height: 10),
@@ -2074,7 +2068,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
             children: [
               _memoryKindPill(h, item.kind),
               const SizedBox(width: 8),
-              Text('模型提议',
+              Text(tr('模型提议'),
                   style: TextStyle(fontSize: 12, color: h.textFaint)),
             ],
           ),
@@ -2087,7 +2081,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
               const Spacer(),
               _scopeAction(
                 key: ValueKey('memory_reject_${item.id}'),
-                label: '忽略',
+                label: tr('忽略'),
                 color: h.textDim,
                 onTap: _busy
                     ? null
@@ -2096,7 +2090,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
               const SizedBox(width: 6),
               _scopeAction(
                 key: ValueKey('memory_promote_${item.id}'),
-                label: '晋升为全局',
+                label: tr('晋升为全局'),
                 color: h.text,
                 onTap:
                     _busy ? null : () => _resolveProposal(item, promote: true),
@@ -2113,7 +2107,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
     final h = Hue.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('记忆'),
+        title: Text(tr('记忆')),
         leading: _iosBackLeading(context),
       ),
       body: !_loaded
@@ -2130,7 +2124,7 @@ class _GlobalMemoryPageState extends State<GlobalMemoryPage> {
                 // 没有会话上下文 ⇒ 不画一个假的会话记忆段，指向会话去
                 if (!_hasSession)
                   Center(
-                    child: Text('会话私有记忆只在该会话里生效 · 进入某个会话查看',
+                    child: Text(tr('会话私有记忆只在该会话里生效 · 进入某个会话查看'),
                         textAlign: TextAlign.center,
                         style: TextStyle(
                             fontSize: 12.5, height: 1.6, color: h.textFaint)),
@@ -2289,7 +2283,7 @@ class _MemoryEditorSheetState extends State<_MemoryEditorSheet> {
     if (!r.ok) {
       setState(() {
         _saving = false;
-        _error = r.error ?? '保存失败';
+        _error = r.error ?? tr('保存失败');
       });
       return;
     }
@@ -2315,7 +2309,7 @@ class _MemoryEditorSheetState extends State<_MemoryEditorSheet> {
             children: [
               const SizedBox(height: HSpace.md),
               Text(
-                _isEdit ? '编辑记忆' : '添加记忆',
+                _isEdit ? tr('编辑记忆') : '添加记忆',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -2328,7 +2322,7 @@ class _MemoryEditorSheetState extends State<_MemoryEditorSheet> {
                 autofocus: true,
                 maxLines: 5,
                 minLines: 3,
-                placeholder: '写下要长期记住的事…',
+                placeholder: tr('写下要长期记住的事…'),
                 style: TextStyle(fontSize: 15, color: h.text),
                 placeholderStyle:
                     TextStyle(fontSize: 15, color: h.textFaint),
@@ -2393,8 +2387,7 @@ class _MemoryEditorSheetState extends State<_MemoryEditorSheet> {
                           color: h.dark
                               ? const Color(0xFF0A0A0B)
                               : Colors.white)
-                      : Text(
-                          '保存',
+                      : Text(tr('保存'),
                           style: TextStyle(
                             fontSize: 15,
                             fontWeight: FontWeight.w600,
@@ -2442,7 +2435,7 @@ class GeneralSettingsPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('通用设置'), leading: _iosBackLeading(context)),
+      appBar: AppBar(title: Text(tr('通用设置')), leading: _iosBackLeading(context)),
       body: ValueListenableBuilder<AppSettings>(
         valueListenable: controller,
         builder: (context, s, _) {
@@ -2456,26 +2449,31 @@ class GeneralSettingsPage extends StatelessWidget {
             //   警示行。旧版「值胶囊 + 滑杆」双控件与步进器全部退役。
             //   页尾权限组（默认权限 + 始终允许）是安全设置、没有第二
             //   个入口，随卡片化保留。
-            const _SectionLabel('显示'),
+            _SectionLabel(tr('显示')),
+            // ★ 2026-11-10（v0.5.1 英文第一版）：**拦「选 English 就弹不
+            //   支持」的那段删了** —— 选中即生效。两条线各管一半：
+            //   · `controller.setLanguage(v)` = 持久化（下次启动 main() 里
+            //     `setAppLocale(settings.value.language.name)` 再同步回来）；
+            //   · `setAppLocale(v.name)` = 立刻切当期语言（根件监听 appLocale
+            //     整体重建 ⇒ 走 tr() 的文案当场变英文）。
+            //   ⚠️ 英文是**分批覆盖**的：没翻到的条目 tr() 原样返回中文，
+            //   所以副行如实写「未翻译的条目仍显示中文」，不吹"完整支持英文"。
             _SettingsCard(
-              title: '界面语言',
-              subtitle: '目前仅支持中文；English 暂未提供',
+              title: tr('界面语言'),
+              subtitle: tr('中文 / English；未翻译的条目仍显示中文'),
               child: _SegControl<AppLanguage>(
                 value: s.language,
                 options: AppLanguage.values,
                 labelOf: (v) => v.label,
                 onChanged: (v) {
-                  if (v == AppLanguage.en) {
-                    showIosToast(context, '暂不支持英文，后续版本提供');
-                    return;
-                  }
+                  setAppLocale(v.name);
                   unawaited(controller.setLanguage(v));
                 },
               ),
             ),
             _SettingsCard(
-              title: '字号大小',
-              subtitle: '全局字阶按比例缩放，拖动实时预览',
+              title: tr('字号大小'),
+              subtitle: tr('全局字阶按比例缩放，拖动实时预览'),
               trailing: Text(
                 '${_fontStopLabel(s.fontSize)} · ${s.fontSize.round()}',
                 style: TextStyle(fontSize: 14, color: h.textDim),
@@ -2495,10 +2493,10 @@ class GeneralSettingsPage extends StatelessWidget {
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text('小',
+                        Text(tr('小'),
                             style: TextStyle(
                                 fontSize: 12, color: h.textFaint)),
-                        Text('大',
+                        Text(tr('大'),
                             style: TextStyle(
                                 fontSize: 12, color: h.textFaint)),
                       ],
@@ -2507,10 +2505,10 @@ class GeneralSettingsPage extends StatelessWidget {
                 ],
               ),
             ),
-            const _SectionLabel('行为'),
+            _SectionLabel(tr('行为')),
             _SettingsCard(
-              title: '工作步骤展示',
-              subtitle: '选择希望看到多少工具调用细节',
+              title: tr('工作步骤展示'),
+              subtitle: tr('选择希望看到多少工具调用细节'),
               child: _SegControl<StepDetail>(
                 value: s.stepDetail,
                 options: StepDetail.values,
@@ -2521,31 +2519,30 @@ class GeneralSettingsPage extends StatelessWidget {
             // ★ 2026-11-08 用户要求：键盘回车语义可切换（默认「使用独立发送按钮」）
             const _KeyboardEnterCard(),
             _SettingsCard(
-              title: '繁忙时发送',
-              subtitle: '任务执行中发消息如何处理',
+              title: tr('繁忙时发送'),
+              subtitle: tr('任务执行中发消息如何处理'),
               child: _SegControl<BusySendBehavior>(
                 value: s.busySend,
                 options: BusySendBehavior.values,
-                labelOf: (v) => v == BusySendBehavior.queue ? '排队' : '插队',
+                labelOf: (v) => v == BusySendBehavior.queue ? tr('排队') : '插队',
                 onChanged: controller.setBusySend,
               ),
             ),
             _SettingsCard(
-              title: '最大轮次',
-              subtitle: '单次任务最多执行的工具轮次',
+              title: tr('最大轮次'),
+              subtitle: tr('单次任务最多执行的工具轮次'),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _SegControl<int>(
                     value: s.maxTurns,
                     options: kMaxTurnsOptions,
-                    labelOf: (v) => v == 0 ? '自动' : '$v',
+                    labelOf: (v) => v == 0 ? tr('自动') : '$v',
                     onChanged: controller.setMaxTurns,
                   ),
                   const SizedBox(height: 10),
-                  Text(
-                    '自动 = 云端 40 轮（默认）。轮次越多，单次任务能做的步骤'
-                    '越多，但可能跑更久；云端按轮计费，花费也更多。',
+                  Text(tr('自动 = 云端 40 轮（默认）。轮次越多，单次任务能做的步骤'
+                    '越多，但可能跑更久；云端按轮计费，花费也更多。'),
                     style: TextStyle(
                         fontSize: 12, height: 1.5, color: h.textFaint),
                   ),
@@ -2554,15 +2551,15 @@ class GeneralSettingsPage extends StatelessWidget {
             ),
             // ---- 流式输出：默认开启、不设关闭开关（用户拍板）----
             _SettingsCard(
-              title: '流式输出',
-              subtitle: '逐字显示模型回复',
-              trailing: Text('始终开启',
+              title: tr('流式输出'),
+              subtitle: tr('逐字显示模型回复'),
+              trailing: Text(tr('始终开启'),
                   style: TextStyle(fontSize: 14, color: h.textDim)),
             ),
-            const _SectionLabel('权限'),
+            _SectionLabel(tr('权限')),
             _SettingsCard(
-              title: '新会话的默认权限',
-              subtitle: '决定工具执行前是否需要你确认',
+              title: tr('新会话的默认权限'),
+              subtitle: tr('决定工具执行前是否需要你确认'),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -2601,14 +2598,13 @@ class ModelSettingsPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final h = Hue.of(context);
     return Scaffold(
-      appBar: AppBar(title: Text('模型'), leading: _iosBackLeading(context)),
+      appBar: AppBar(title: Text(tr('模型')), leading: _iosBackLeading(context)),
       body: ValueListenableBuilder<AppSettings>(
         valueListenable: controller,
         builder: (context, s, _) => ListView(
           padding: const EdgeInsets.all(HSpace.lg),
           children: [
-            Text(
-              '填入各提供商的 API 密钥即可使用其模型。',
+            Text(tr('填入各提供商的 API 密钥即可使用其模型。'),
               style: TextStyle(fontSize: 13, color: h.textFaint),
             ),
             const SizedBox(height: HSpace.lg),
@@ -2710,7 +2706,7 @@ class _ProviderCard extends StatelessWidget {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
                   child: Text(
-                    provider.name.isEmpty ? '(未命名)' : provider.name,
+                    provider.name.isEmpty ? tr('(未命名)') : provider.name,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -2722,15 +2718,15 @@ class _ProviderCard extends StatelessWidget {
                 BwActionCard(
                   h: h,
                   icon: CupertinoIcons.square_pencil_fill,
-                  label: '编辑',
+                  label: tr('编辑'),
                   onTap: () => Navigator.of(sheetCtx).pop(false),
                 ),
                 const SizedBox(height: 8),
                 BwActionCard(
                   h: h,
                   icon: CupertinoIcons.trash_fill,
-                  label: '删除',
-                  subtitle: '同时清除已保存的 API Key',
+                  label: tr('删除'),
+                  subtitle: tr('同时清除已保存的 API Key'),
                   danger: true,
                   onTap: () => Navigator.of(sheetCtx).pop(true),
                 ),
@@ -2745,10 +2741,10 @@ class _ProviderCard extends StatelessWidget {
       // ★ 二次确认 —— 删除不可逆（连带清掉 Keystore 里的 Key）
       final ok = await showBwConfirmSheet(
         context,
-        title: '删除这个提供商？',
+        title: tr('删除这个提供商？'),
         message: '「${provider.name.isEmpty ? "(未命名)" : provider.name}」的配置'
             '与已保存的 API Key 都会被清除，无法恢复。',
-        confirmLabel: '删除',
+        confirmLabel: tr('删除'),
         destructive: true,
       );
       if (ok && context.mounted) onDelete?.call();
@@ -2817,7 +2813,7 @@ class _ProviderCard extends StatelessWidget {
                     children: [
                       Flexible(
                         child: Text(
-                          provider.name.isEmpty ? '(未命名)' : provider.name,
+                          provider.name.isEmpty ? tr('(未命名)') : provider.name,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
@@ -2836,8 +2832,7 @@ class _ProviderCard extends StatelessWidget {
                             color: h.accent.withValues(alpha: 0.15),
                             borderRadius: BorderRadius.circular(HRadius.pill),
                           ),
-                          child: Text(
-                            '默认',
+                          child: Text(tr('默认'),
                             style: TextStyle(
                               fontSize: 10,
                               fontWeight: FontWeight.w600,
@@ -2855,7 +2850,7 @@ class _ProviderCard extends StatelessWidget {
                     //   不该显示"未配置"。
                     configured
                         ? '${provider.model} · ${provider.baseUrl}'
-                        : '未配置 API Key',
+                        : tr('未配置 API Key'),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -2872,14 +2867,14 @@ class _ProviderCard extends StatelessWidget {
                 minimumSize: const Size(0, 36),
                 padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
                 foregroundColor: h.textDim,
-                child: Text('设为默认', style: TextStyle(fontSize: 12)),
+                child: Text(tr('设为默认'), style: TextStyle(fontSize: 12)),
               ),
             CupertinoButton(
               onPressed: onEdit,
               minimumSize: const Size(0, 36),
               padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
               foregroundColor: h.text,
-              child: Text('编辑', style: TextStyle(fontSize: 12.5)),
+              child: Text(tr('编辑'), style: TextStyle(fontSize: 12.5)),
             ),
           ],
         ),
@@ -2937,7 +2932,7 @@ class _JevCardState extends State<_JevCard> {
           case JevSource.local2b:
             final downloaded = _jev.isDownloaded(config.source);
             ready = downloaded;
-            status = downloaded ? '模型已下载 · 引擎未接入' : '模型未下载';
+            status = downloaded ? tr('模型已下载 · 引擎未接入') : '模型未下载';
         }
         return Container(
           margin: const EdgeInsets.only(bottom: HSpace.md),
@@ -2964,8 +2959,7 @@ class _JevCardState extends State<_JevCard> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'JEV 决策引擎',
+                      Text(tr('JEV 决策引擎'),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
@@ -2989,7 +2983,7 @@ class _JevCardState extends State<_JevCard> {
                   minimumSize: const Size(0, 36),
                   padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
                   foregroundColor: h.text,
-                  child: const Text('编辑', style: TextStyle(fontSize: 12.5)),
+                  child: Text(tr('编辑'), style: TextStyle(fontSize: 12.5)),
                 ),
               ],
             ),
@@ -3024,8 +3018,7 @@ class _AddProviderButton extends StatelessWidget {
           children: [
             Icon(AppIcons.add, size: 19, color: h.textDim),
             SizedBox(width: HSpace.sm),
-            Text(
-              '添加模型提供商',
+            Text(tr('添加模型提供商'),
               style: TextStyle(fontSize: 13.5, color: h.textDim),
             ),
           ],
@@ -3065,9 +3058,14 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
   ///
   /// 留空 = 用后端默认（本地 4096 / 云端 128K）。
   /// 「获取可用模型」若从 `/models` 读到真实值，会自动填进来。
+  /// ★ 2026-11-10（用户点名）：初值必须走**人类可读单位** —— `128K` / `32K` /
+  /// `1M`，不是换算后的 `131072` / `32768`。用户原话：「我要他显示的就是
+  /// 128k 和 32k，或者 1M 也是！不是换算后的！」
+  /// 规则由 [formatTokenCount] 承担（1M 整除 → `M`、1024 整除 → `K`、否则纯
+  /// 数字、`<= 0` → 空串靠占位符）。**别写回 `.toString()`。**
   late final TextEditingController _contextLength = TextEditingController(
     text: widget.provider.contextLength > 0
-        ? widget.provider.contextLength.toString()
+        ? formatTokenCount(widget.provider.contextLength)
         : '',
   );
 
@@ -3080,9 +3078,10 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
   ///   真机 bug：原来写死 `const []` —— 每次进编辑页目录都空，
   ///   保存后把已存的目录**覆盖回空**，用户"保存了但目录里不显示"）。
   /// **单轮最大输出 token**（2026-11-05 用户要求可配，留空 = 契约默认 16384）。
+  /// ★ 同上：输出上限初值也走 [formatTokenCount]（`32768 → 32K`）。
   late final TextEditingController _maxOut = TextEditingController(
     text: widget.provider.maxOutputTokens > 0
-        ? widget.provider.maxOutputTokens.toString()
+        ? formatTokenCount(widget.provider.maxOutputTokens)
         : '',
   );
 
@@ -3200,7 +3199,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
     }
     final p = widget.provider.copyWith(
       name: _name.text.trim().isEmpty
-          ? (_model.text.trim().isEmpty ? '未命名' : _model.text.trim())
+          ? (_model.text.trim().isEmpty ? tr('未命名') : _model.text.trim())
           : _name.text.trim(),
       baseUrl: _baseUrl.text.trim(),
       model: _model.text.trim(),
@@ -3243,7 +3242,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
     final h = Hue.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.isNew ? '添加提供商' : '编辑提供商'),
+        title: Text(widget.isNew ? tr('添加提供商') : '编辑提供商'),
         leading: _iosBackLeading(context),
         actions: [
           CupertinoButton(
@@ -3251,7 +3250,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
             minimumSize: const Size(0, 44),
             padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
             foregroundColor: h.accent,
-            child: const Text('保存'),
+            child: Text(tr('保存')),
           ),
           const SizedBox(width: HSpace.sm),
         ],
@@ -3259,7 +3258,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
       body: ListView(
         padding: const EdgeInsets.all(HSpace.lg),
         children: [
-          _Field(label: '名称', controller: _name, hint: '例如：我的 DeepSeek'),
+          _Field(label: tr('名称'), controller: _name, hint: tr('例如：我的 DeepSeek')),
           _Field(
             label: 'Base URL',
             controller: _baseUrl,
@@ -3280,7 +3279,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('API 协议',
+                Text(tr('API 协议'),
                     style: TextStyle(fontSize: 12.5, color: h.textDim)),
                 const SizedBox(height: HSpace.sm),
                 Container(
@@ -3300,7 +3299,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
                       // bw 单选抽屉。
                       final p = await showBwRadioSheet<ProviderProtocol>(
                         context,
-                        title: 'API 协议',
+                        title: tr('API 协议'),
                         options: ProviderProtocol.values,
                         current: _protocol,
                         labelOf: (o) => o.label,
@@ -3414,7 +3413,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
           // 标准端点 GET /v1/models。
           Row(
             children: [
-              Text('模型目录', style: TextStyle(fontSize: 13, color: h.textDim)),
+              Text(tr('模型目录'), style: TextStyle(fontSize: 13, color: h.textDim)),
               const Spacer(),
               // ★ 2026-11-05 用户要求：与「获取可用模型」同样的文字按钮样式，
               //   点一下把目录清空（没有"默认模型"清单，就不假装有 —— 直接清空，
@@ -3429,7 +3428,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
                         }),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: HSpace.xs),
-                  child: Text('恢复默认模型',
+                  child: Text(tr('恢复默认模型'),
                       style: TextStyle(fontSize: 12, color: h.textDim)),
                 ),
               ),
@@ -3440,7 +3439,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
                   child: _loadingModels
                       ? CupertinoActivityIndicator(
                           radius: 6, color: h.accent)
-                      : Text('获取可用模型',
+                      : Text(tr('获取可用模型'),
                           style: TextStyle(fontSize: 12, color: h.accent)),
                 ),
               ),
@@ -3464,8 +3463,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
                 border: Border.all(color: h.border),
                 borderRadius: BorderRadius.circular(HRadius.sm),
               ),
-              child: Text(
-                '模型选择器中将不显示任何模型；目录外 ID 仍可直接发送。',
+              child: Text(tr('模型选择器中将不显示任何模型；目录外 ID 仍可直接发送。'),
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12, color: h.textFaint),
               ),
@@ -3515,7 +3513,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
                 child: CupertinoTextField(
                   controller: _model,
                   style: TextStyle(fontSize: 14, color: h.text),
-                  placeholder: '手填模型 ID（目录外也可直接发送）',
+                  placeholder: tr('手填模型 ID（目录外也可直接发送）'),
                   placeholderStyle: TextStyle(fontSize: 12, color: h.textFaint),
                   padding: const EdgeInsets.symmetric(
                       horizontal: HSpace.sm, vertical: HSpace.sm),
@@ -3527,7 +3525,7 @@ class _ProviderEditPageState extends State<ProviderEditPage> {
               ),
               const SizedBox(width: HSpace.sm),
               IosButton(
-                label: '+ 添加',
+                label: tr('+ 添加'),
                 filled: false,
                 color: h.accent,
                 dense: true,
@@ -3651,7 +3649,7 @@ class _TestConnectionButtonState extends State<_TestConnectionButton> {
         setState(() {
           _ok = true;
           _result = echo.isEmpty
-              ? '✅ 连接成功（HTTP 200）'
+              ? tr('✅ 连接成功（HTTP 200）')
               : '✅ 连接成功，模型回：${echo.trim().substring(0, echo.trim().length.clamp(0, 60))}';
         });
       } else if (resp.statusCode == 401) {
@@ -3691,7 +3689,7 @@ class _TestConnectionButtonState extends State<_TestConnectionButton> {
         SizedBox(
           width: 140, // 热区达标
           child: IosButton(
-            label: _testing ? '测试中…' : '测试连接',
+            label: _testing ? tr('测试中…') : '测试连接',
             filled: false,
             color: h.accent,
             busy: _testing,
@@ -3780,7 +3778,7 @@ class AppearanceSettingsPage extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar:
-          AppBar(title: Text('外观'), leading: _iosBackLeading(context)),
+          AppBar(title: Text(tr('外观')), leading: _iosBackLeading(context)),
       body: ValueListenableBuilder<AppSettings>(
         valueListenable: controller,
         builder: (context, s, _) => ListView(
@@ -3789,7 +3787,7 @@ class AppearanceSettingsPage extends StatelessWidget {
             // ★ 深浅（2026-10-25 晚按概念图 08 定稿）：三张预览卡 ——
             //   卡内是界面骨架缩略图（浅 / 深 / 一半一半），比图标钮
             //   一眼更明白；选中 = 深色描边。
-            const _SectionLabel('深浅'),
+            _SectionLabel(tr('深浅')),
             _AppearancePreviewRow(
               value: s.appearance,
               onChanged: (v, center) {
@@ -3820,7 +3818,7 @@ class AppearanceSettingsPage extends StatelessWidget {
             ),
             // ★ 主题选择（2026-10-24，用户拍板）：代替已移除的强调色选择。
             //   只换颜色与背景，不换布局；默认黑白。
-            const _SectionLabel('主题'),
+            _SectionLabel(tr('主题')),
             for (final t in AppThemeStyle.values)
               _ThemeCard(
                 style: t,
@@ -3828,7 +3826,7 @@ class AppearanceSettingsPage extends StatelessWidget {
                 dark: Hue.of(context).dark,
                 onTap: () => controller.setThemeStyle(t),
               ),
-            const _SectionLabel('显示'),
+            _SectionLabel(tr('显示')),
             // 显示 + 效果合并一张卡（概念图 08 形态）：三行共用
             // _CardRow、同一左缩进顶格对齐。图标风格是既定设计语言
             // （黑白填充），只报状态不做假开关。
@@ -3843,7 +3841,7 @@ class AppearanceSettingsPage extends StatelessWidget {
                 child: Column(
                   children: [
                     _CardRow(
-                      title: '界面字号',
+                      title: tr('界面字号'),
                       value: _fontStopLabel(_nearestFontStop(s.fontSize)),
                       onTap: () => Navigator.of(context).push(
                         CupertinoPageRoute(
@@ -3857,15 +3855,15 @@ class AppearanceSettingsPage extends StatelessWidget {
                         indent: 18,
                         endIndent: 18,
                         color: Hue.of(context).border),
-                    const _CardRow(title: '图标风格', value: '填充 · 黑白'),
+                    _CardRow(title: tr('图标风格'), value: '填充 · 黑白'),
                     Divider(
                         height: 1,
                         indent: 18,
                         endIndent: 18,
                         color: Hue.of(context).border),
                     _CardRow(
-                      title: '玻璃效果',
-                      subtitle: '面板使用半透明毛玻璃质感',
+                      title: tr('玻璃效果'),
+                      subtitle: tr('面板使用半透明毛玻璃质感'),
                       trailing: ElasticSwitch(
                         value: s.glassEffect,
                         onChanged: controller.setGlassEffect,
@@ -4027,7 +4025,7 @@ class _AboutPageState extends State<AboutPage> {
       opened = false;
     }
     if (!mounted) return;
-    if (!opened) showIosToast(context, '无法打开浏览器');
+    if (!opened) showIosToast(context, tr('无法打开浏览器'));
   }
 
   /// 开源许可证 = **应用内完整列表**（同一套 iOS 侧滑路由，与设置页二级页一致）。
@@ -4041,7 +4039,7 @@ class _AboutPageState extends State<AboutPage> {
   Widget build(BuildContext context) {
     final h = Hue.of(context);
     return Scaffold(
-      appBar: AppBar(title: Text('关于'), leading: _iosBackLeading(context)),
+      appBar: AppBar(title: Text(tr('关于')), leading: _iosBackLeading(context)),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
         children: [
@@ -4072,10 +4070,10 @@ class _AboutPageState extends State<AboutPage> {
                       ),
                     ),
                     const SizedBox(height: 2),
-                    Text('手机上的开发智能体',
+                    Text(tr('手机上的开发智能体'),
                         style: TextStyle(fontSize: 13, color: h.textDim)),
                     const SizedBox(height: 4),
-                    Text(_version.isEmpty ? '版本 —' : '版本 $_version',
+                    Text(_version.isEmpty ? tr('版本 —') : '版本 $_version',
                         style: TextStyle(fontSize: 12, color: h.textFaint)),
                   ],
                 ),
@@ -4083,43 +4081,42 @@ class _AboutPageState extends State<AboutPage> {
             ],
           ),
           const SizedBox(height: 20),
-          Text(
-            'Heracles 是一个装在手机里的开发智能体：一句话说清需求，'
+          Text(tr('Heracles 是一个装在手机里的开发智能体：一句话说清需求，'
             '它就在你的手机上读文件、改代码、跑命令，把 App 构建、解包、'
-            '重打包成能直接安装的成品——从想法到装上手机，一台手机全搞定。',
+            '重打包成能直接安装的成品——从想法到装上手机，一台手机全搞定。'),
             style: TextStyle(fontSize: 15, height: 1.65, color: h.text),
           ),
           const SizedBox(height: 24),
           _AboutSection(
-            title: '它能做什么',
+            title: tr('它能做什么'),
             children: [
               _AboutFeature(
                 icon: CupertinoIcons.hammer_fill,
-                title: '在手机上开发',
+                title: tr('在手机上开发'),
                 body: '把项目文件夹设为工作区，它读代码、改文件、跑命令；'
                     '改动先以 diff 呈现，你确认后才落盘。',
               ),
               _AboutFeature(
                 icon: CupertinoIcons.cube_box_fill,
-                title: '本机构建与改包',
+                title: tr('本机构建与改包'),
                 body: '无需电脑和 Gradle，在手机上完成编译、打包、签名，'
                     '产出可安装的 APK；也能解包、修改、重打包现有应用。',
               ),
               _AboutFeature(
                 icon: CupertinoIcons.list_bullet,
-                title: '任务计划看得见',
+                title: tr('任务计划看得见'),
                 body: '复杂任务自动拆成步骤，进度挂在屏幕顶部的灵动岛上，'
                     '走到哪一步、还剩什么，随时可看可调整。',
               ),
               _AboutFeature(
                 icon: CupertinoIcons.doc_text_fill,
-                title: '记得住你的习惯',
+                title: tr('记得住你的习惯'),
                 body: '偏好、背景与项目约定会被结构化记住，新会话自动带上；'
                     '所有记忆都可查、可改、可删。',
               ),
               _AboutFeature(
                 icon: CupertinoIcons.link,
-                title: '接入你自己的模型',
+                title: tr('接入你自己的模型'),
                 body: '自带 API Key 接入云端大模型，支持 OpenAI 兼容与 '
                     'Anthropic 两种协议，思考等级可调。',
               ),
@@ -4127,22 +4124,22 @@ class _AboutPageState extends State<AboutPage> {
           ),
           const SizedBox(height: 20),
           _AboutSection(
-            title: '安全与隐私',
+            title: tr('安全与隐私'),
             children: [
               _AboutFeature(
                 icon: CupertinoIcons.lock_fill,
-                title: 'Key 只存在这台手机上',
+                title: tr('Key 只存在这台手机上'),
                 body: '你的 API Key 只保存在本机，不经过任何中转服务器。',
               ),
               _AboutFeature(
                 icon: CupertinoIcons.checkmark_shield_fill,
-                title: '危险操作先经你确认',
+                title: tr('危险操作先经你确认'),
                 body: '删除文件、执行命令等操作默认先弹窗征得同意；'
                     '三档权限模式，放行程度由你决定。',
               ),
               _AboutFeature(
                 icon: CupertinoIcons.eye_fill,
-                title: '数据去向透明',
+                title: tr('数据去向透明'),
                 body: 'Heracles 没有自己的服务器，不收集你的数据；'
                     '代码只会发送给你自己配置的模型服务商。',
               ),
@@ -4150,20 +4147,20 @@ class _AboutPageState extends State<AboutPage> {
           ),
           const SizedBox(height: 20),
           _AboutSection(
-            title: '开源与反馈',
+            title: tr('开源与反馈'),
             children: [
               _CardRow(
-                title: 'GitHub 仓库',
+                title: tr('GitHub 仓库'),
                 value: 'theohowie/Heracles',
                 onTap: () => _openUrl(_repoUrl),
               ),
               _CardRow(
-                title: '问题反馈',
+                title: tr('问题反馈'),
                 value: 'GitHub Issues',
                 onTap: () => _openUrl(_issuesUrl),
               ),
               _CardRow(
-                title: '开源许可证',
+                title: tr('开源许可证'),
                 value: '完整列表',
                 onTap: _openLicenses,
               ),
@@ -4171,18 +4168,17 @@ class _AboutPageState extends State<AboutPage> {
           ),
           const SizedBox(height: 20),
           _AboutSection(
-            title: '版本信息',
+            title: tr('版本信息'),
             children: [
-              _CardRow(title: '当前版本', value: _version.isEmpty ? '—' : _version),
+              _CardRow(title: tr('当前版本'), value: _version.isEmpty ? '—' : _version),
               if (_build.isNotEmpty)
-                _CardRow(title: '构建号', value: _build),
-              const _CardRow(title: '运行平台', value: 'Android'),
-              const _CardRow(title: '开发框架', value: 'Flutter · Dart'),
+                _CardRow(title: tr('构建号'), value: _build),
+              _CardRow(title: tr('运行平台'), value: 'Android'),
+              _CardRow(title: tr('开发框架'), value: 'Flutter · Dart'),
             ],
           ),
           const SizedBox(height: 26),
-          Text(
-            '© 2026 Heracles 项目 · 开源软件',
+          Text(tr('© 2026 Heracles 项目 · 开源软件'),
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12, color: h.textFaint),
           ),
@@ -4843,7 +4839,7 @@ double _nearestFontStop(double v) {
 }
 
 String _fontStopLabel(double v) =>
-    v <= 13.0 ? '小' : (v >= 18.0 ? '大' : '标准');
+    v <= 13.0 ? tr('小') : (v >= 18.0 ? tr('大') : '标准');
 
 class _SectionLabel extends StatelessWidget {
   const _SectionLabel(this.text);
@@ -4906,13 +4902,13 @@ class _AlwaysAllowedRowState extends State<_AlwaysAllowedRow> {
     // 加载中不显示（一闪而过的"无"比不显示更让人困惑）
     if (tools == null) return const SizedBox.shrink();
     return _SettingsCard(
-      title: '已始终允许的工具',
-      subtitle: '审批时选过「始终允许」的工具',
+      title: tr('已始终允许的工具'),
+      subtitle: tr('审批时选过「始终允许」的工具'),
       child: Row(
         children: [
           Expanded(
             child: Text(
-              tools.isEmpty ? '无' : tools.join('、'),
+              tools.isEmpty ? tr('无') : tools.join('、'),
               style: TextStyle(fontSize: 13.5, color: h.textDim),
             ),
           ),
@@ -4921,7 +4917,7 @@ class _AlwaysAllowedRowState extends State<_AlwaysAllowedRow> {
               onPressed: _clear,
               minimumSize: const Size(0, 36),
               padding: const EdgeInsets.symmetric(horizontal: HSpace.sm),
-              child: const Text('清除', style: TextStyle(fontSize: 12)),
+              child: Text(tr('清除'), style: TextStyle(fontSize: 12)),
             ),
         ],
       ),
@@ -4944,13 +4940,13 @@ class _KeyboardEnterCardState extends State<_KeyboardEnterCard> {
   @override
   Widget build(BuildContext context) {
     return _SettingsCard(
-      title: '使用独立发送按钮',
-      subtitle: '开启后键盘回车插入换行，发送只走右下按钮；关闭则为回车即发送',
+      title: tr('使用独立发送按钮'),
+      subtitle: tr('开启后键盘回车插入换行，发送只走右下按钮；关闭则为回车即发送'),
       child: Row(
         children: [
           Expanded(
             child: Text(
-              AgentBridge.separateSendButton ? '回车 = 换行' : '回车 = 发送',
+              AgentBridge.separateSendButton ? tr('回车 = 换行') : '回车 = 发送',
               style: const TextStyle(fontSize: 13),
             ),
           ),

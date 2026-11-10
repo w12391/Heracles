@@ -8,6 +8,8 @@ import '../theme/app_theme.dart';
 import '../theme/cupertino_kit.dart';
 import '../widgets/bw_approval.dart';
 
+import 'package:heracles/i18n/l10n.dart';
+
 /// **沙箱页**（2026-10-28，docs/INTERFACE.md §8 + 用户定调）。
 ///
 /// ## 定位（用户定调，别做偏）
@@ -101,12 +103,12 @@ class _SandboxScreenState extends State<SandboxScreen> {
       _status = st;
     });
     if (st.installed) {
-      showIosToast(context, '沙箱已激活');
+      showIosToast(context, tr('沙箱已激活'));
       _refresh();
     } else {
       // activate 的失败原因被客户端收敛进状态形状，这里只能如实
       // 报「没装上」+ 最可能的下一步（内置失败会走 OCI 兜底，要网）。
-      showIosToast(context, '激活失败：内置环境不可用时需要联网重试');
+      showIosToast(context, tr('激活失败：内置环境不可用时需要联网重试'));
     }
   }
 
@@ -114,10 +116,10 @@ class _SandboxScreenState extends State<SandboxScreen> {
     if (_resetting) return;
     final ok = await showBwConfirmSheet(
       context,
-      title: '重置沙箱？',
-      message: '沙箱里的环境、产物和缓存会被整块清掉，回到未激活状态。'
-          '挂载点指向的外部文件不受影响。',
-      confirmLabel: '重置',
+      title: tr('重置沙箱？'),
+      message: tr('沙箱里的环境、产物和缓存会被整块清掉，回到未激活状态。'
+          '挂载点指向的外部文件不受影响。'),
+      confirmLabel: tr('重置'),
       destructive: true,
     );
     if (!ok || !mounted) return;
@@ -129,10 +131,10 @@ class _SandboxScreenState extends State<SandboxScreen> {
       _status = st;
     });
     if (!st.installed) {
-      showIosToast(context, '沙箱已重置');
+      showIosToast(context, tr('沙箱已重置'));
       _refresh();
     } else {
-      showIosToast(context, '重置失败：后端尚未支持重置');
+      showIosToast(context, tr('重置失败：后端尚未支持重置'));
     }
   }
 
@@ -143,7 +145,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
     return Scaffold(
       backgroundColor: h.bg,
       appBar: AppBar(
-        title: const Text('沙箱'),
+        title: Text(tr('沙箱')),
         leading: IconButton(
           icon: const Icon(AppIcons.back, size: 21),
           onPressed: () => Navigator.of(context).pop(),
@@ -155,27 +157,26 @@ class _SandboxScreenState extends State<SandboxScreen> {
         children: [
           _statusCard(h, st),
           const SizedBox(height: HSpace.lg),
-          _sectionLabel(h, '挂载点'),
+          _sectionLabel(h, tr('挂载点')),
           _mountsCard(h, st),
           const SizedBox(height: HSpace.lg),
-          _sectionLabel(h, '执行通道'),
+          _sectionLabel(h, tr('执行通道')),
           _channelsCard(h, st),
           Padding(
             padding: const EdgeInsets.fromLTRB(4, HSpace.sm, 4, 0),
-            child: Text(
-              '通道只展示可用性，放不放行由权限门禁决定。',
+            child: Text(tr('通道只展示可用性，放不放行由权限门禁决定。'),
               style: TextStyle(fontSize: 12, color: h.textFaint, height: 1.55),
             ),
           ),
           if (st != null && st.installed) ...[
             const SizedBox(height: HSpace.lg),
-            _sectionLabel(h, '编译环境'),
+            _sectionLabel(h, tr('编译环境')),
             _buildSuiteCard(h),
             const SizedBox(height: HSpace.lg),
-            _sectionLabel(h, '环境'),
+            _sectionLabel(h, tr('环境')),
             const SandboxEnvSection(),
             const SizedBox(height: HSpace.lg),
-            _sectionLabel(h, '管理'),
+            _sectionLabel(h, tr('管理')),
             _resetCard(h),
           ],
         ],
@@ -232,7 +233,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
               ),
               const SizedBox(width: HSpace.sm),
               Text(
-                st == null ? '正在读取状态…' : (installed ? '已激活' : '未激活'),
+                st == null ? tr('正在读取状态…') : (installed ? tr('已激活') : '未激活'),
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -241,8 +242,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
               ),
               if (st != null && installed && st.prootReady) ...[
                 const Spacer(),
-                Text(
-                  'PRoot 就绪',
+                Text(tr('PRoot 就绪'),
                   style: TextStyle(fontSize: 12, color: h.textFaint),
                 ),
               ],
@@ -252,17 +252,14 @@ class _SandboxScreenState extends State<SandboxScreen> {
           Text(
             installed
                 ? (st!.rootfsSummary.isEmpty
-                    ? '内置 Linux 环境已就绪。'
+                    ? tr('内置 Linux 环境已就绪。')
                     : st.rootfsSummary)
-                : '内置的 Alpine Linux 环境还没有装好。激活会解包约 9 MB 的 '
-                    'rootfs（离线内置，不需要联网），之后 agent 的命令默认 '
-                    '在沙箱里执行，产物与真机文件分开存放。',
+                : tr('内置的 Alpine Linux 环境还没有装好。激活会解包约 9 MB 的 ' 'rootfs（离线内置，不需要联网），之后 agent 的命令默认 ' '在沙箱里执行，产物与真机文件分开存放。'),
             style: TextStyle(fontSize: 13, color: h.textDim, height: 1.6),
           ),
           if (st != null && installed && !st.prootReady) ...[
             const SizedBox(height: HSpace.xs),
-            Text(
-              'PRoot 尚未就绪，命令暂时无法在沙箱执行。',
+            Text(tr('PRoot 尚未就绪，命令暂时无法在沙箱执行。'),
               style: TextStyle(
                 fontSize: 13,
                 color: HColors.warnOn(h.dark),
@@ -295,8 +292,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                               ),
                             ),
                             const SizedBox(width: HSpace.sm),
-                            Text(
-                              '正在解包 rootfs…',
+                            Text(tr('正在解包 rootfs…'),
                               style: TextStyle(
                                 fontSize: 14.5,
                                 fontWeight: FontWeight.w600,
@@ -305,8 +301,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                             ),
                           ],
                         )
-                      : Text(
-                          '激活沙箱',
+                      : Text(tr('激活沙箱'),
                           style: TextStyle(
                             fontSize: 14.5,
                             fontWeight: FontWeight.w600,
@@ -327,8 +322,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
     if (!installed) {
       return _card(
         h,
-        Text(
-          '激活后显示。沙箱通过 @名字 访问外部目录。',
+        Text(tr('激活后显示。沙箱通过 @名字 访问外部目录。'),
           style: TextStyle(fontSize: 13, color: h.textFaint, height: 1.6),
         ),
       );
@@ -336,8 +330,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
     if (_mounts.isEmpty) {
       return _card(
         h,
-        Text(
-          '暂无挂载点。',
+        Text(tr('暂无挂载点。'),
           style: TextStyle(fontSize: 13, color: h.textFaint, height: 1.6),
         ),
       );
@@ -395,7 +388,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                       borderRadius: BorderRadius.circular(999),
                     ),
                     child: Text(
-                      _mounts[i].readOnly ? '只读' : '读写',
+                      _mounts[i].readOnly ? tr('只读') : '读写',
                       style: TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.w600,
@@ -419,8 +412,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
     if (channels.isEmpty) {
       return _card(
         h,
-        Text(
-          '暂无通道信息。',
+        Text(tr('暂无通道信息。'),
           style: TextStyle(fontSize: 13, color: h.textFaint, height: 1.6),
         ),
       );
@@ -462,7 +454,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                       ),
                       const SizedBox(width: HSpace.sm),
                       Text(
-                        channels[i].available ? '可用' : '不可用',
+                        channels[i].available ? tr('可用') : '不可用',
                         style: TextStyle(
                           fontSize: 12.5,
                           color: channels[i].available
@@ -540,7 +532,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        ready ? '编译环境 · 已就绪' : '编译环境 · 未安装',
+                        ready ? tr('编译环境 · 已就绪') : '编译环境 · 未安装',
                         style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w500,
@@ -554,7 +546,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                                 '${version.isEmpty ? '' : ' · 版本 $version'}'
                             : (_activatingSuite
                                 ? (_suiteStage.isEmpty
-                                    ? '正在准备…'
+                                    ? tr('正在准备…')
                                     : _suiteStage)
                                 : '约 415 MB · 需要联网下载${missingText.isEmpty ? '' : '（缺 $missingText）'}'),
                         style: TextStyle(fontSize: 13, color: h.textFaint),
@@ -587,8 +579,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                               borderRadius: BorderRadius.circular(18),
                             ),
                           ),
-                          child: Text(
-                            '下载',
+                          child: Text(tr('下载'),
                             style: TextStyle(
                               fontSize: 14,
                               fontWeight: FontWeight.w600,
@@ -601,8 +592,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
             // ---- 已安装：装在哪 + 单独卸载（2026-10-29 T2-7）----
             if (ready && installDir.isNotEmpty) ...[
               const SizedBox(height: 10),
-              Text(
-                '安装位置',
+              Text(tr('安装位置'),
                 style: TextStyle(fontSize: 11.5, color: h.textFaint),
               ),
               const SizedBox(height: 2),
@@ -641,8 +631,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                           color: HColors.errorOn(h.dark),
                         ),
                       )
-                    : Text(
-                        '卸载编译环境',
+                    : Text(tr('卸载编译环境'),
                         style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w600,
@@ -673,10 +662,10 @@ class _SandboxScreenState extends State<SandboxScreen> {
   Future<void> _activateSuite() async {
     final ok = await showBwConfirmSheet(
       context,
-      title: '下载编译环境？',
-      message: '需要下载约 415 MB（JDK 17 + Gradle + android.jar）。'
-          '建议在 Wi-Fi 下进行；中断后可以续传。',
-      confirmLabel: '下载',
+      title: tr('下载编译环境？'),
+      message: tr('需要下载约 415 MB（JDK 17 + Gradle + android.jar）。'
+          '建议在 Wi-Fi 下进行；中断后可以续传。'),
+      confirmLabel: tr('下载'),
     );
     if (ok != true) return;
 
@@ -693,7 +682,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
       _suitePercent = -1;
       _suiteStage = '';
     });
-    showIosToast(context, r.ok ? (r.alreadyReady ? '编译环境已就绪' : '编译环境已装好') : '失败：${r.message}');
+    showIosToast(context, r.ok ? (r.alreadyReady ? tr('编译环境已就绪') : '编译环境已装好') : '失败：${r.message}');
   }
 
   /// **卸载 T2 编译环境**（2026-10-29 T2-7）。
@@ -714,12 +703,14 @@ class _SandboxScreenState extends State<SandboxScreen> {
     final sizeText = bytes > 0 ? _formatBytes(bytes) : '';
     final ok = await showBwConfirmSheet(
       context,
-      title: '卸载编译环境？',
+      title: tr('卸载编译环境？'),
+      // 含运行时插值（体积文案），不包 tr()：英文下这里仍显示中文，
+      // 属于「分批覆盖」的已知缺口（字典 key 无法承载变量）。
       message: '会删除沙箱里的 JDK 17、Gradle 和 android.jar'
           '${sizeText.isEmpty ? '' : '（约 $sizeText）'}。'
           '卸载后沙箱就不能编译 APK 了，下次要用需要重新下载；'
           '源码工作区与手机的其它文件不受影响。',
-      confirmLabel: '卸载',
+      confirmLabel: tr('卸载'),
       destructive: true,
     );
     if (ok != true || !mounted) return;
@@ -756,7 +747,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
           .map((f) => '${f.path}（${f.reason}）')
           .join('；');
     }
-    return r.message.isEmpty ? '后端未返回原因' : r.message;
+    return r.message.isEmpty ? tr('后端未返回原因') : r.message;
   }
 
   Widget _resetCard(Hue h) {
@@ -775,8 +766,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    '重置沙箱',
+                  Text(tr('重置沙箱'),
                     style: TextStyle(
                       fontSize: 16,
                       fontWeight: FontWeight.w500,
@@ -784,8 +774,7 @@ class _SandboxScreenState extends State<SandboxScreen> {
                     ),
                   ),
                   const SizedBox(height: 3),
-                  Text(
-                    '整块回滚，清掉环境与产物',
+                  Text(tr('整块回滚，清掉环境与产物'),
                     style: TextStyle(fontSize: 13, color: h.textFaint),
                   ),
                 ],
